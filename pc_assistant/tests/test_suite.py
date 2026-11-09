@@ -791,7 +791,7 @@ class TestMemoryManager(unittest.TestCase):
         mock_emb.embed_query.return_value = [0.1, 0.2, 0.3]
         mock_emb_cls.return_value = mock_emb
 
-        mem = MemoryManager(path="/fake/path")
+        mem = MemoryManager(path=str(Path(_TEST_TMP_DIR) / "fake_path"))
         fact = " Mom's email is mom@example.com "
         expected_id = hashlib.sha256("mom's email is mom@example.com".encode("utf-8")).hexdigest()
 
@@ -827,7 +827,7 @@ class TestMemoryManager(unittest.TestCase):
         mock_emb.embed_query.return_value = [0.1, 0.2, 0.3]
         mock_emb_cls.return_value = mock_emb
 
-        mem = MemoryManager(path="/fake/path", max_distance=1.3)
+        mem = MemoryManager(path=str(Path(_TEST_TMP_DIR) / "fake_path"), max_distance=1.3)
         res = mem.search_memory("mom email")
 
         # Must embed with search_query prefix
@@ -857,7 +857,7 @@ class TestMemoryManager(unittest.TestCase):
         mock_emb.embed_query.return_value = [0.1, 0.2, 0.3]
         mock_emb_cls.return_value = mock_emb
 
-        mem = MemoryManager(path="/fake/path", max_distance=1.3)
+        mem = MemoryManager(path=str(Path(_TEST_TMP_DIR) / "fake_path"), max_distance=1.3)
         res = mem.search_memory("unrelated query")
         self.assertEqual(res, "")
 
@@ -1144,7 +1144,7 @@ class TestMemoryUpsert(unittest.TestCase):
         mock_emb.embed_query.return_value = [0.1, 0.2, 0.3]
         mock_emb_cls.return_value = mock_emb
 
-        mem = MemoryManager(path="/fake/path")
+        mem = MemoryManager(path=str(Path(_TEST_TMP_DIR) / "fake_path"))
 
         # 1st upsert
         _run(mem.aupsert("grandma", "email", "old@y.com"))
@@ -1174,7 +1174,7 @@ class TestMemoryUpsert(unittest.TestCase):
         mock_emb.embed_query.return_value = [0.1, 0.2, 0.3]
         mock_emb_cls.return_value = mock_emb
 
-        mem = MemoryManager(path="/fake/path")
+        mem = MemoryManager(path=str(Path(_TEST_TMP_DIR) / "fake_path"))
         _run(mem.aupsert("mom", "email", "x@y.com"))
         _run(mem.aupsert("mom", "phone", "555-0199"))
 
@@ -1195,7 +1195,7 @@ class TestMemoryUpsert(unittest.TestCase):
         mock_emb.embed_query.return_value = [0.1, 0.2, 0.3]
         mock_emb_cls.return_value = mock_emb
 
-        mem = MemoryManager(path="/fake/path")
+        mem = MemoryManager(path=str(Path(_TEST_TMP_DIR) / "fake_path"))
         _run(mem.aupsert("user", "allergy", "peanuts"))
         doc = mock_coll.upsert.call_args[1]["documents"][0]
         self.assertEqual(doc, "User's allergy is peanuts")
