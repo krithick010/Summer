@@ -1,0 +1,23 @@
+# Environments and secrets
+.env
+.env.*
+!.env.example
+credentials/
+*.token.json
+token.json
+
+# Databases and cache
+data/
+history.db
+memory_db/
+__pycache__/
+*.pyc
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store

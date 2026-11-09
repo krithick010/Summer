@@ -1,0 +1,28 @@
+# Web framework & server
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+
+# Telegram Bot
+python-telegram-bot==21.11.1
+
+# HTTP client
+httpx==0.28.1
+
+# Environment variable management
+python-dotenv==1.2.4
+
+# System telemetry (p_system.py)
+psutil==6.1.1
+
+# Gmail API (p_gmail.py)
+google-auth==2.62.1
+google-auth-oauthlib==1.5.0
+google-auth-httplib2==0.4.4
+google-api-python-client==2.201.0
+
+# Data validation
+jsonschema==4.23.0
+
+# Vector Database & Long-Term Memory
+chromadb==1.5.9
+langchain-ollama==1.1.0

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    env:
+      TELEGRAM_BOT_TOKEN: "dummy_bot_token_123456:ABCdefGHIjklMNOpqrsTUVwxyz"
+      ALLOWED_USER_IDS: "1"
+      HISTORY_DB_PATH: ":memory:"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r pc_assistant/requirements.txt
+
+      - name: Run test suite
+        working-directory: pc_assistant
+        run: |
+          python -u tests/test_suite.py
+
