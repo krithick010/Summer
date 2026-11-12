@@ -26,7 +26,10 @@ class WeatherPlugin(PluginBase):
     """Fetches a compact one-line weather report from wttr.in."""
 
     name = "get_weather"
-    description = "Gets the current weather and forecast for a specific city or location."
+    description = (
+        "Fetches current weather conditions, temperature, humidity, and wind for a city."
+    )
+    usage_hint = "any question about weather, temperature, rain or the forecast"
     parameters_schema = {
         "type": "object",
         "properties": {

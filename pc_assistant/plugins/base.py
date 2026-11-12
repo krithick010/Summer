@@ -74,6 +74,9 @@ class PluginBase(abc.ABC):
     #: One-to-two sentence description injected into the LLM tool-prompt
     description: str = ""
 
+    #: Optional short trigger rule used in the generated system prompt TOOLS section
+    usage_hint: str = ""
+
     #: JSON-Schema object describing accepted keyword arguments.
     #: Follows the JSON Schema ``"object"`` type with ``"properties"`` and
     #: ``"required"`` keys so the LLM knows exactly what to pass.

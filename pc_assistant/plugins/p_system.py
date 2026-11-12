@@ -21,10 +21,9 @@ class SystemInfoPlugin(PluginBase):
     # NOTE: name must match the tool_name used in main.py's /status handler
     name = "system_info"
     description = (
-        "Returns current PC health metrics: CPU load percentage, available RAM "
-        "in GB, total RAM in GB, and free disk space on the primary drive. "
-        "Use this when the user asks about system status, performance, or resources."
+        "Reads current local PC resource usage including CPU load, RAM, and free disk space."
     )
+    usage_hint = "only for questions about this PC's CPU, RAM or disk"
     parameters_schema = {
         "type": "object",
         "properties": {},

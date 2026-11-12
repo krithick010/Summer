@@ -2243,15 +2243,73 @@ class TestSystemPrompt(unittest.TestCase):
     def test_prompt_helper_braces_in_values_are_safe(self):
         import config
         from core.orchestrator import build_system_prompt
+        from plugins.base import PluginBase, PluginResult
+
+        class BracedPlugin(PluginBase):
+            name = "braced_tool"
+            description = "Desc with {curls}"
+            usage_hint = "queries containing {json_braces}"
+            parameters_schema = {"type": "object", "properties": {}}
+            async def execute(self, **kwargs):
+                return PluginResult(success=True, output="ok")
 
         with patch.object(config, "USER_LOCATION", "Berlin {Mitte}"):
             prompt = build_system_prompt(
                 memories="Note with {braces}",
                 user_name="Sam {K}",
+                plugins=[BracedPlugin()],
             )
 
         self.assertIn("Sam {K} lives in Berlin {Mitte}.", prompt)
         self.assertIn("Note with {braces}", prompt)
+        self.assertIn("- braced_tool: use for queries containing {json_braces}", prompt)
+
+    def test_prompt_includes_registered_plugins_and_excludes_disabled(self):
+        from core.orchestrator import Orchestrator, build_system_prompt
+        from plugins.base import PluginBase, PluginResult
+
+        class FallbackDescPlugin(PluginBase):
+            name = "no_hint_tool"
+            description = "clean description fallback"
+            parameters_schema = {"type": "object", "properties": {}}
+            async def execute(self, **kwargs):
+                return PluginResult(success=True, output="ok")
+
+        with patch("core.orchestrator.MemoryManager"), \
+             patch("plugins.p_gmail.GmailPlugin.is_available", return_value=False):
+            orch = Orchestrator()
+            orch.registry["no_hint_tool"] = FallbackDescPlugin()
+            prompt = build_system_prompt(plugins=orch.registry.values())
+
+        self.assertIn("TOOLS (use them, never guess):", prompt)
+        self.assertIn(
+            "- get_weather: use for any question about weather, temperature, rain or the forecast",
+            prompt,
+        )
+        self.assertIn(
+            "- get_ai_news: use for any request for AI news, headlines or what's new in AI",
+            prompt,
+        )
+        self.assertIn(
+            "- search_wikipedia: use for when they ask you to look something up, or mention Wikipedia",
+            prompt,
+        )
+        self.assertIn(
+            "- system_info: use for only for questions about this PC's CPU, RAM or disk",
+            prompt,
+        )
+        self.assertIn("- no_hint_tool: use for clean description fallback", prompt)
+        self.assertNotIn("- send_email:", prompt)
+        self.assertNotIn("- save_memory:", prompt)
+        self.assertNotIn("Never call tools for greetings, questions or small talk.", prompt)
+        self.assertIn(
+            "Never answer weather, news, lookups or PC stats from your own knowledge.",
+            prompt,
+        )
+        self.assertIn(
+            "Call the tool again every time, even if you answered something similar earlier.",
+            prompt,
+        )
 
 
 class TestConfigEnvExampleSanity(unittest.TestCase):

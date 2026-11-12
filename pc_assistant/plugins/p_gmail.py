@@ -42,10 +42,9 @@ _SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
 class GmailPlugin(PluginBase):
     name = "send_email"
     description = (
-        "Drafts and sends an email via Gmail to a specified recipient. "
-        "Use this when the user asks to send, write, or email someone. "
-        "Always requires user approval before sending."
+        "Sends an email via Gmail to a specified recipient with a subject and body."
     )
+    usage_hint = "only when they clearly ask to send an email"
     parameters_schema = {
         "type": "object",
         "properties": {

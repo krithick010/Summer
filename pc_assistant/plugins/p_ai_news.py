@@ -78,9 +78,9 @@ class AINewsPlugin(PluginBase):
 
     name = "get_ai_news"
     description = (
-        "Scrapes the web for the top latest news headlines regarding "
-        "Artificial Intelligence."
+        "Fetches the latest artificial intelligence news headlines and article links."
     )
+    usage_hint = "any request for AI news, headlines or what's new in AI"
     # PluginBase requires a non-empty parameters_schema dict; empty-object JSON Schema
     # represents zero parameters cleanly for Ollama tool calling.
     parameters_schema = {

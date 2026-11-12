@@ -29,9 +29,9 @@ class WikipediaPlugin(PluginBase):
 
     name = "search_wikipedia"
     description = (
-        "Searches Wikipedia for a topic and returns a brief summary. "
-        "Use this to answer factual, historical, or scientific questions."
+        "Looks up a topic, person, or concept on Wikipedia and returns a short summary."
     )
+    usage_hint = "when they ask you to look something up, or mention Wikipedia"
     parameters_schema = {
         "type": "object",
         "properties": {

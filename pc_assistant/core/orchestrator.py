@@ -14,6 +14,7 @@ import inspect
 import logging
 import pkgutil
 import time
+from collections.abc import Iterable, Mapping
 from typing import Any, Callable
 
 import config
@@ -34,10 +35,7 @@ Talk like a close friend texting: casual, short (1-2 sentences), natural. No cor
 - Never say "do you need anything else", "what do you want to do with that" or "let me know if...". Don't end with a question unless you truly need an answer.
 - If you don't know something, say so in a few words: "Nope, don't have that. Wanna give it to me?"
 
-TOOLS:
-- Only call system_info if they ask about PC performance. Only call send_email if they clearly ask to send one.
-- Never call tools for greetings, questions or small talk.
-- When a tool returns a list (like headlines), pass it along as a short list instead of summarizing it away.
+{tools_section}
 
 Facts they tell you are saved automatically, so just acknowledge them. Don't repeat the whole fact back unless it was a correction.
 
@@ -47,13 +45,40 @@ WHAT YOU KNOW ABOUT {user_name} (their own private data, share it freely when as
 If something isn't listed above or in the chat, say you don't know. Never make things up.{location_line}"""
 
 
+def _format_tools_section(plugins_arg: Iterable[PluginBase] | Mapping[str, PluginBase] | None) -> str:
+    """Render the TOOLS prompt section from registered, available chat plugins."""
+    plugin_lines: list[str] = []
+    if plugins_arg is not None:
+        plugin_iter = plugins_arg.values() if isinstance(plugins_arg, Mapping) else plugins_arg
+        for p in plugin_iter:
+            if p.name == "save_memory":
+                continue
+            is_avail = getattr(p, "is_available", None)
+            if callable(is_avail) and not is_avail():
+                continue
+            hint = (getattr(p, "usage_hint", "") or getattr(p, "description", "") or "").strip()
+            plugin_lines.append(f"- {p.name}: use for {hint}")
+
+    lines = [
+        "TOOLS (use them, never guess):",
+        *plugin_lines,
+        "- Never answer weather, news, lookups or PC stats from your own knowledge. If you did not call the tool, you do not have the answer.",
+        "- Call the tool again every time, even if you answered something similar earlier.",
+        "- After a tool returns, report its result faithfully. If it failed, say so in one short line. Don't suggest other places or topics.",
+        "- For greetings, small talk and anything about facts he told you, don't call tools.",
+        "- When a tool returns a list (like headlines), pass it along as a short list instead of summarizing it away.",
+    ]
+    return "\n".join(lines)
+
+
 def build_system_prompt(
     memories: str = "",
     assistant_name: str | None = None,
     user_name: str | None = None,
     user_location: str | None = None,
+    plugins: Iterable[PluginBase] | Mapping[str, PluginBase] | None = None,
 ) -> str:
-    """Build the system prompt formatting {assistant_name}, {user_name}, and {memories}."""
+    """Build the system prompt formatting names, memories, active tools, and location."""
     resolved_user_name = user_name or USER_NAME
     resolved_location = (
         user_location if user_location is not None else config.USER_LOCATION
@@ -68,6 +93,7 @@ def build_system_prompt(
         assistant_name=assistant_name or ASSISTANT_NAME,
         user_name=resolved_user_name,
         memories=memories or "(nothing yet)",
+        tools_section=_format_tools_section(plugins),
         location_line=location_line,
     )
 
@@ -123,6 +149,21 @@ class Orchestrator:
                         log.info("Registered plugin: %r", instance)
                     except Exception as exc:  # noqa: BLE001
                         log.error("Failed to instantiate plugin %s: %s", obj.__name__, exc)
+
+    def _chat_tools(self) -> list[dict[str, Any]]:
+        """Build Ollama tool schemas for all active non-memory plugins."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": p.name,
+                    "description": p.description,
+                    "parameters": p.parameters_schema,
+                },
+            }
+            for p in self.registry.values()
+            if p.name != "save_memory"
+        ]
 
     async def run_tool(
         self,
@@ -191,23 +232,14 @@ class Orchestrator:
             retrieval_ms = (time.perf_counter() - t_ret) * 1000.0
 
             msgs: list[dict[str, Any]] = [
-                {"role": "system", "content": build_system_prompt(memories)}
+                {
+                    "role": "system",
+                    "content": build_system_prompt(memories, plugins=self.registry.values()),
+                }
             ]
             msgs += hist + [{"role": "user", "content": message}]
 
-            # Hide save_memory from the chat model — extraction is handled by background extractor
-            tools = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": p.name,
-                        "description": p.description,
-                        "parameters": p.parameters_schema,
-                    },
-                }
-                for p in self.registry.values()
-                if p.name != "save_memory"
-            ]
+            tools = self._chat_tools()
 
             reply = await self.llm.chat(msgs, tools=tools)
             log.info("tool_calls=%s", reply.get("tool_calls"))
@@ -305,23 +337,14 @@ class Orchestrator:
         memories = await self.memory.asearch_memory(last_user, k=MEMORY_TOP_K) if last_user else ""
 
         msgs: list[dict[str, Any]] = [
-            {"role": "system", "content": build_system_prompt(memories)}
+            {
+                "role": "system",
+                "content": build_system_prompt(memories, plugins=self.registry.values()),
+            }
         ]
         msgs += hist
 
-        # Hide save_memory from the chat model — extraction is handled by background extractor
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": p.name,
-                    "description": p.description,
-                    "parameters": p.parameters_schema,
-                },
-            }
-            for p in self.registry.values()
-            if p.name != "save_memory"
-        ]
+        tools = self._chat_tools()
 
         reply = await self.llm.chat(msgs, tools=tools)
         log.info("tool_calls=%s", reply.get("tool_calls"))
