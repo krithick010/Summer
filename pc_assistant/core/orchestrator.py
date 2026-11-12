@@ -15,6 +15,7 @@ import logging
 import pkgutil
 from typing import Any, Callable
 
+import config
 from config import ASSISTANT_NAME, EXTRACTOR_ENABLED, MEMORY_TOP_K, USER_NAME
 from core.history import History
 from core.llm_engine import LLMEngine
@@ -35,25 +36,38 @@ Talk like a close friend texting: casual, short (1-2 sentences), natural. No cor
 TOOLS:
 - Only call system_info if they ask about PC performance. Only call send_email if they clearly ask to send one.
 - Never call tools for greetings, questions or small talk.
+- When a tool returns a list (like headlines), pass it along as a short list instead of summarizing it away.
 
 Facts they tell you are saved automatically, so just acknowledge them. Don't repeat the whole fact back unless it was a correction.
 
 WHAT YOU KNOW ABOUT {user_name} (their own private data, share it freely when asked; newest first):
 {memories}
 
-If something isn't listed above or in the chat, say you don't know. Never make things up."""
+If something isn't listed above or in the chat, say you don't know. Never make things up.{location_line}"""
 
 
 def build_system_prompt(
     memories: str = "",
     assistant_name: str | None = None,
     user_name: str | None = None,
+    user_location: str | None = None,
 ) -> str:
     """Build the system prompt formatting {assistant_name}, {user_name}, and {memories}."""
+    resolved_user_name = user_name or USER_NAME
+    resolved_location = (
+        user_location if user_location is not None else config.USER_LOCATION
+    ).strip()
+    location_line = (
+        f"\n{resolved_user_name} lives in {resolved_location}. "
+        "For weather, news or anything local, assume this place unless they name another."
+        if resolved_location
+        else ""
+    )
     return SYSTEM_TEMPLATE.format(
         assistant_name=assistant_name or ASSISTANT_NAME,
-        user_name=user_name or USER_NAME,
+        user_name=resolved_user_name,
         memories=memories or "(nothing yet)",
+        location_line=location_line,
     )
 
 

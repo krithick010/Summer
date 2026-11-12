@@ -78,6 +78,24 @@ EXTRACTOR_ENABLED: bool = os.getenv("EXTRACTOR_ENABLED", "true").strip().lower()
 # User and assistant identity
 USER_NAME: str = os.getenv("USER_NAME", "friend")
 ASSISTANT_NAME: str = os.getenv("ASSISTANT_NAME", "Summer")
+# Optional home location used as context for local queries (e.g. "City, Region, Country")
+USER_LOCATION: str = os.getenv("USER_LOCATION", "").strip()
+
+# ---------------------------------------------------------------------------
+# Web Plugins (Playwright)
+# ---------------------------------------------------------------------------
+# Run headless Chromium by default; set to false to watch the browser window
+BROWSER_HEADLESS: bool = os.getenv("BROWSER_HEADLESS", "true").strip().lower() in ("true", "1", "yes")
+# Comma-separated AI news URLs tried in order until one yields enough headlines
+_DEFAULT_AI_NEWS_URLS = (
+    "https://techcrunch.com/category/artificial-intelligence/,"
+    "https://venturebeat.com/category/ai/"
+)
+AI_NEWS_URLS: list[str] = [
+    u.strip()
+    for u in os.getenv("AI_NEWS_URLS", _DEFAULT_AI_NEWS_URLS).split(",")
+    if u.strip()
+]
 
 # ---------------------------------------------------------------------------
 # Conversation History & Context

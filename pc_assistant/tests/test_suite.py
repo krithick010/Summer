@@ -36,6 +36,12 @@ os.environ["HISTORY_DB_PATH"] = ":memory:"
 _TEST_TMP_DIR = tempfile.mkdtemp(prefix="summer_test_")
 os.environ["DATA_DIR"] = _TEST_TMP_DIR
 os.environ["MEMORY_DB_PATH"] = str(Path(_TEST_TMP_DIR) / "memory_db")
+os.environ["USER_LOCATION"] = ""
+os.environ["BROWSER_HEADLESS"] = "true"
+os.environ["AI_NEWS_URLS"] = (
+    "https://techcrunch.com/category/artificial-intelligence/,"
+    "https://venturebeat.com/category/ai/"
+)
 
 # ---------------------------------------------------------------------------
 # Silence noisy third-party warnings so test output stays readable
@@ -1779,8 +1785,48 @@ class TestSystemPrompt(unittest.TestCase):
         self.assertIn("You are Summer, friend's personal assistant", prompt)
         self.assertIn("WHAT YOU KNOW ABOUT friend", prompt)
         self.assertIn("(nothing yet)", prompt)
+        self.assertIn(
+            "When a tool returns a list (like headlines), pass it along as a short list instead of summarizing it away.",
+            prompt,
+        )
+        self.assertNotIn("lives in", prompt)
         unformatted = re.findall(r"\{[a-zA-Z0-9_]+\}", prompt)
         self.assertEqual(unformatted, [])
+
+    def test_prompt_helper_includes_user_location_when_set(self):
+        import config
+        from core.orchestrator import build_system_prompt
+
+        with patch.object(config, "USER_LOCATION", "Paris, France"):
+            prompt = build_system_prompt(user_name="Alex")
+
+        self.assertIn(
+            "Alex lives in Paris, France. For weather, news or anything local, assume this place unless they name another.",
+            prompt,
+        )
+
+    def test_prompt_helper_omits_user_location_when_unset(self):
+        import config
+        from core.orchestrator import build_system_prompt
+
+        with patch.object(config, "USER_LOCATION", "   "):
+            prompt = build_system_prompt(user_name="Alex")
+
+        self.assertNotIn("lives in", prompt)
+        self.assertNotIn("assume this place", prompt)
+
+    def test_prompt_helper_braces_in_values_are_safe(self):
+        import config
+        from core.orchestrator import build_system_prompt
+
+        with patch.object(config, "USER_LOCATION", "Berlin {Mitte}"):
+            prompt = build_system_prompt(
+                memories="Note with {braces}",
+                user_name="Sam {K}",
+            )
+
+        self.assertIn("Sam {K} lives in Berlin {Mitte}.", prompt)
+        self.assertIn("Note with {braces}", prompt)
 
 
 class TestConfigEnvExampleSanity(unittest.TestCase):
