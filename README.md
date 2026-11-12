@@ -28,12 +28,13 @@ To prevent Ollama from constantly unloading and reloading models between generat
 - **Windows**:
   ```cmd
   setx OLLAMA_MAX_LOADED_MODELS 2
+  setx OLLAMA_NUM_PARALLEL 1
   ```
   *(Restart terminal after setting)*
 
 - **Linux / macOS**:
   ```bash
-  OLLAMA_MAX_LOADED_MODELS=2 ollama serve
+  OLLAMA_MAX_LOADED_MODELS=2 OLLAMA_NUM_PARALLEL=1 ollama serve
   ```
 
 ---

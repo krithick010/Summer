@@ -66,6 +66,8 @@ SERVER_HOST: str = os.getenv("SERVER_HOST", "0.0.0.0")
 OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
 OLLAMA_NUM_CTX: int = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+# Shared keep-alive duration for chat and extractor so Ollama keeps the model warm
+OLLAMA_KEEP_ALIVE: str = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 # Max tokens the LLM is allowed to generate per response
 LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "512"))
 # Temperature for LLM generation
@@ -128,6 +130,8 @@ HITL_TIMEOUT_SECONDS: int = int(os.getenv("HITL_TIMEOUT_SECONDS", "120"))
 # Vector Memory (ChromaDB + nomic-embed-text)
 # ---------------------------------------------------------------------------
 EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
+# Run embeddings on CPU (num_gpu=0) by default so chat LLM keeps GPU VRAM
+EMBED_ON_CPU: bool = os.getenv("EMBED_ON_CPU", "true").strip().lower() in ("true", "1", "yes")
 MEMORY_TOP_K: int = int(os.getenv("MEMORY_TOP_K", "5"))
 MEMORY_MAX_DISTANCE: float = float(os.getenv("MEMORY_MAX_DISTANCE", "1.3"))
 # Backward-compatibility alias

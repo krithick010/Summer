@@ -67,7 +67,7 @@ class LLMEngine:
             "model": config.OLLAMA_MODEL,
             "messages": messages,
             "stream": False,
-            "keep_alive": "30m",
+            "keep_alive": config.OLLAMA_KEEP_ALIVE,
             "options": {
                 "temperature": config.LLM_TEMPERATURE if temperature is None else temperature,
                 "num_ctx": config.OLLAMA_NUM_CTX,

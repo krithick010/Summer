@@ -22,6 +22,7 @@ from typing import Any
 import chromadb
 from langchain_ollama import OllamaEmbeddings
 
+import config
 from config import (
     DATA_DIR,
     EMBEDDING_MODEL,
@@ -71,11 +72,14 @@ class MemoryManager:
 
         log.info("Initialising OllamaEmbeddings (model=%s, base_url=%s)", self.model, self.base_url)
         # keep_alive in langchain_ollama expects int seconds (1800s = 30m)
-        self.embeddings = OllamaEmbeddings(
-            model=self.model,
-            base_url=self.base_url,
-            keep_alive=1800,
-        )
+        emb_kwargs: dict[str, Any] = {
+            "model": self.model,
+            "base_url": self.base_url,
+            "keep_alive": 1800,
+        }
+        if config.EMBED_ON_CPU:
+            emb_kwargs["num_gpu"] = 0
+        self.embeddings = OllamaEmbeddings(**emb_kwargs)
 
         self.collection = self.client.get_or_create_collection(name=self.collection_name)
         self._check_collection_compatibility()

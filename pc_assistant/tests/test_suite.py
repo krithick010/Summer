@@ -494,6 +494,38 @@ class TestLLMEngine(unittest.TestCase):
         self.assertEqual(os.environ.get("DATA_DIR"), before_data)
         self.assertEqual(os.environ.get("HISTORY_DB_PATH"), before_hist)
 
+    @patch("httpx.AsyncClient.post")
+    def test_extractor_shares_num_ctx_and_keep_alive_with_chat(self, mock_post):
+        import config
+        from core.extractor import extract_facts
+        from core.llm_engine import LLMEngine
+
+        chat_resp = MagicMock()
+        chat_resp.raise_for_status = MagicMock()
+        chat_resp.json.return_value = {"message": {"role": "assistant", "content": "Hi"}}
+
+        ext_resp = MagicMock()
+        ext_resp.raise_for_status = MagicMock()
+        ext_resp.json.return_value = {"message": {"content": '{"facts": []}'}}
+
+        mock_post.side_effect = [chat_resp, ext_resp]
+
+        with patch.object(config, "OLLAMA_NUM_CTX", 8192), \
+             patch.object(config, "OLLAMA_KEEP_ALIVE", "45m"):
+            engine = LLMEngine()
+            _run(engine.chat(messages=[{"role": "user", "content": "Hi"}]))
+            _run(extract_facts([], "Hi"))
+
+        chat_payload = mock_post.call_args_list[0][1]["json"]
+        ext_payload = mock_post.call_args_list[1][1]["json"]
+        self.assertEqual(ext_payload["options"]["num_ctx"], chat_payload["options"]["num_ctx"])
+        self.assertEqual(ext_payload["options"]["num_ctx"], 8192)
+        self.assertEqual(ext_payload["keep_alive"], chat_payload["keep_alive"])
+        self.assertEqual(ext_payload["keep_alive"], "45m")
+        self.assertEqual(ext_payload["options"]["temperature"], 0)
+        self.assertEqual(ext_payload["options"]["num_predict"], 200)
+        self.assertIn("format", ext_payload)
+
 
 class TestOrchestrator(unittest.TestCase):
     """Test single-call conversational Orchestrator with native tool calling."""
@@ -976,6 +1008,27 @@ class TestMemoryManager(unittest.TestCase):
         mem = MemoryManager(path=str(Path(_TEST_TMP_DIR) / "fake_path"), max_distance=1.3)
         res = mem.search_memory("unrelated query")
         self.assertEqual(res, "")
+
+    @patch("chromadb.PersistentClient")
+    @patch("core.memory.OllamaEmbeddings")
+    def test_embed_on_cpu_passes_or_omits_num_gpu(self, mock_emb_cls, mock_client_cls):
+        import config
+        from core.memory import MemoryManager
+
+        mock_coll = MagicMock()
+        mock_coll.count.return_value = 0
+        mock_client = MagicMock()
+        mock_client.get_or_create_collection.return_value = mock_coll
+        mock_client_cls.return_value = mock_client
+
+        with patch.object(config, "EMBED_ON_CPU", True):
+            MemoryManager(path=str(Path(_TEST_TMP_DIR) / "fake_cpu_true"))
+        self.assertEqual(mock_emb_cls.call_args[1].get("num_gpu"), 0)
+
+        mock_emb_cls.reset_mock()
+        with patch.object(config, "EMBED_ON_CPU", False):
+            MemoryManager(path=str(Path(_TEST_TMP_DIR) / "fake_cpu_false"))
+        self.assertNotIn("num_gpu", mock_emb_cls.call_args[1])
 
 
 class TestExtractor(unittest.TestCase):
@@ -1656,7 +1709,25 @@ class TestWebScraper(unittest.TestCase):
             )
 
         self.assertTrue(result.success)
-        pw_instance.chromium.launch.assert_awaited_once_with(headless=False)
+        pw_instance.chromium.launch.assert_awaited_once_with(
+            headless=False,
+            args=["--disable-gpu"],
+        )
+
+    def test_chromium_launch_includes_disable_gpu(self):
+        from plugins.web_scraper import scrape_page_body
+
+        mock_factory, _, _, _ = _make_body_playwright_mock(body_text="ok")
+        pw_instance = mock_factory.return_value.start.return_value
+
+        with patch("playwright.async_api.async_playwright", mock_factory):
+            result = _run(
+                scrape_page_body("https://example.com", max_chars=100, label="GpuFlag")
+            )
+
+        self.assertTrue(result.success)
+        launch_kwargs = pw_instance.chromium.launch.call_args[1]
+        self.assertIn("--disable-gpu", launch_kwargs.get("args", []))
 
     def test_blocked_resource_types_are_aborted(self):
         from plugins.web_scraper import _abort_heavy_resources

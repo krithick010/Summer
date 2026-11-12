@@ -67,7 +67,10 @@ class WikipediaPlugin(PluginBase):
         try:
             async with async_playwright() as p:
                 try:
-                    browser = await p.chromium.launch(headless=True)
+                    browser = await p.chromium.launch(
+                        headless=True,
+                        args=["--disable-gpu"],
+                    )
                     page = await browser.new_page()
 
                     response = await page.goto(

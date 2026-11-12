@@ -76,7 +76,10 @@ async def _get_browser() -> Any:
         if _playwright is None:
             _playwright = await async_playwright().start()
 
-        _browser = await _playwright.chromium.launch(headless=config.BROWSER_HEADLESS)
+        _browser = await _playwright.chromium.launch(
+            headless=config.BROWSER_HEADLESS,
+            args=["--disable-gpu"],
+        )
         return _browser
 
 
