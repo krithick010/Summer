@@ -1695,90 +1695,207 @@ class TestWeatherPlugin(unittest.TestCase):
         mock_browser.close.assert_not_awaited()
 
 
+def _make_news_playwright_mock(pages_by_url):
+    """Create mocked async_playwright supporting per-URL headlines/errors for AINewsPlugin."""
+
+    async def _new_page_factory():
+        mock_page = MagicMock()
+        mock_page.url = ""
+        mock_page.route = AsyncMock()
+        mock_page.screenshot = AsyncMock()
+        mock_page.title = AsyncMock(return_value="News Page")
+
+        current_items = []
+
+        async def _goto(url, **_kwargs):
+            spec = pages_by_url[url]
+            if isinstance(spec, Exception):
+                raise spec
+            mock_page.url = spec.get("final_url", url)
+            current_items[:] = spec.get("items", [])
+            resp = MagicMock()
+            resp.status = spec.get("status", 200)
+            return resp
+
+        def _locator(_sel):
+            loc = MagicMock()
+            loc.count = AsyncMock(return_value=len(current_items))
+
+            def _nth(idx):
+                text, href = current_items[idx]
+                el = MagicMock()
+                el.inner_text = AsyncMock(return_value=text)
+                el.get_attribute = AsyncMock(return_value=href)
+                return el
+
+            loc.nth = MagicMock(side_effect=_nth)
+            return loc
+
+        mock_page.goto = AsyncMock(side_effect=_goto)
+        mock_page.locator = MagicMock(side_effect=_locator)
+        return mock_page
+
+    mock_browser_ctx = MagicMock()
+    mock_browser_ctx.new_page = AsyncMock(side_effect=_new_page_factory)
+    mock_browser_ctx.close = AsyncMock()
+
+    mock_browser = MagicMock()
+    mock_browser.new_context = AsyncMock(return_value=mock_browser_ctx)
+    mock_browser.close = AsyncMock()
+    mock_browser.is_connected = MagicMock(return_value=True)
+
+    mock_pw_obj = MagicMock()
+    mock_pw_obj.chromium.launch = AsyncMock(return_value=mock_browser)
+    mock_pw_obj.stop = AsyncMock()
+
+    mock_ctx = MagicMock()
+    mock_ctx.start = AsyncMock(return_value=mock_pw_obj)
+
+    return MagicMock(return_value=mock_ctx), mock_browser, mock_browser_ctx
+
+
 class TestAINewsPlugin(unittest.TestCase):
-    """Test AINewsPlugin metadata and TechCrunch AI scraping with mocked Playwright."""
+    """Test AINewsPlugin metadata, multi-source fallback, and untrusted text cleaning."""
 
     def setUp(self):
         from plugins.p_ai_news import AINewsPlugin
         self.plugin = AINewsPlugin()
 
+    def tearDown(self):
+        from plugins.web_scraper import close_browser
+        _run(close_browser())
+
     def test_schema_and_flags(self):
         self.assertEqual(self.plugin.name, "get_ai_news")
         self.assertFalse(self.plugin.requires_approval)
         self.assertEqual(self.plugin.parameters_schema["type"], "object")
+        self.assertEqual(self.plugin.parameters_schema["properties"], {})
         self.assertEqual(self.plugin.parameters_schema["required"], [])
 
-    def test_scrapes_techcrunch_top_5_headlines_and_closes_browser(self):
-        headlines = [
-            "OpenAI announces model update",
-            "Anthropic expands enterprise tooling",
-            "Google DeepMind publishes robotics paper",
-            "Meta releases open weights benchmark",
-            "NVIDIA unveils next-gen inference chip",
-            "Sixth headline should be excluded",
+    def test_first_source_works_and_limits_to_5_with_source_line(self):
+        import config
+
+        items = [
+            (f"Artificial intelligence milestone story number {i}", f"https://techcrunch.com/story-{i}")
+            for i in range(1, 8)
         ]
-        mock_factory, mock_browser, mock_bctx, mock_page = _make_body_playwright_mock(
-            headlines=headlines,
-            url="https://techcrunch.com/category/artificial-intelligence/",
-        )
-        with patch("playwright.async_api.async_playwright", mock_factory):
+        mock_factory, mock_browser, mock_bctx = _make_news_playwright_mock({
+            "https://techcrunch.com/category/artificial-intelligence/": {"items": items},
+        })
+
+        with patch.object(
+            config,
+            "AI_NEWS_URLS",
+            [
+                "https://techcrunch.com/category/artificial-intelligence/",
+                "https://venturebeat.com/category/ai/",
+            ],
+        ), patch("playwright.async_api.async_playwright", mock_factory):
             result = _run(self.plugin.execute())
 
         self.assertTrue(result.success)
         lines = result.output.split("\n")
-        self.assertEqual(len(lines), 5)
-        self.assertEqual(lines[0], "1. OpenAI announces model update")
-        self.assertEqual(lines[4], "5. NVIDIA unveils next-gen inference chip")
+        self.assertEqual(len(lines), 6)
         self.assertEqual(
-            mock_page.goto.call_args[0][0],
-            "https://techcrunch.com/category/artificial-intelligence/",
+            lines[0],
+            "1. Artificial intelligence milestone story number 1 - https://techcrunch.com/story-1",
         )
-        self.assertEqual(mock_page.goto.call_args[1]["wait_until"], "domcontentloaded")
-        ua = mock_browser.new_context.call_args[1]["user_agent"]
-        self.assertIn("Chrome/120.0.0.0", ua)
-        mock_page.locator.assert_called_with("h2, h3")
+        self.assertEqual(
+            lines[4],
+            "5. Artificial intelligence milestone story number 5 - https://techcrunch.com/story-5",
+        )
+        self.assertEqual(lines[5], "Source: techcrunch.com")
         mock_bctx.close.assert_awaited_once()
         mock_browser.close.assert_not_awaited()
 
-    def test_falls_back_to_body_truncated_to_2500(self):
-        long_news = "AI Daily\n\nTop Story\n" + ("article " * 500)
-        mock_factory, mock_browser, mock_bctx, mock_page = _make_body_playwright_mock(
-            body_text=long_news,
-            headlines=[],
-            url="https://techcrunch.com/category/artificial-intelligence/",
-        )
-        with patch("playwright.async_api.async_playwright", mock_factory):
+    def test_first_source_fails_and_second_source_works(self):
+        import config
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+        vb_items = [
+            ("Enterprise AI agents orchestration update one", "/ai/story-1"),
+            ("Enterprise AI governance data layer story two", "/ai/story-2"),
+            ("Enterprise AI inference benchmark story three", "/ai/story-3"),
+        ]
+        mock_factory, mock_browser, mock_bctx = _make_news_playwright_mock({
+            "https://techcrunch.com/category/artificial-intelligence/": PlaywrightTimeoutError("Timeout"),
+            "https://venturebeat.com/category/ai/": {
+                "final_url": "https://venturebeat.com/category/ai",
+                "items": vb_items,
+            },
+        })
+
+        with patch.object(
+            config,
+            "AI_NEWS_URLS",
+            [
+                "https://techcrunch.com/category/artificial-intelligence/",
+                "https://venturebeat.com/category/ai/",
+            ],
+        ), patch("playwright.async_api.async_playwright", mock_factory):
             result = _run(self.plugin.execute())
 
         self.assertTrue(result.success)
+        self.assertIn("https://venturebeat.com/ai/story-1", result.output)
+        self.assertIn("Source: venturebeat.com", result.output)
+        self.assertEqual(mock_bctx.close.await_count, 2)
+        mock_browser.close.assert_not_awaited()
+
+    def test_all_sources_fail_returns_friendly_one_line_error(self):
+        import config
+
+        mock_factory, _, mock_bctx = _make_news_playwright_mock({
+            "https://example.org/ai-1": {"status": 503, "items": []},
+            "https://example.org/ai-2": {
+                "items": [("Only one valid headline long enough", "https://example.org/only-1")]
+            },
+        })
+
+        with patch.object(
+            config,
+            "AI_NEWS_URLS",
+            ["https://example.org/ai-1", "https://example.org/ai-2"],
+        ), patch("playwright.async_api.async_playwright", mock_factory):
+            result = _run(self.plugin.execute())
+
+        self.assertFalse(result.success)
         self.assertNotIn("\n", result.output)
-        self.assertEqual(len(result.output), 2500)
-        self.assertTrue(result.output.startswith("AI Daily Top Story"))
-        mock_bctx.close.assert_awaited_once()
-        mock_browser.close.assert_not_awaited()
+        self.assertIn("couldn't fetch ai news", result.output.lower())
+        self.assertEqual(mock_bctx.close.await_count, 2)
 
-    def test_no_results_returns_error_and_closes_browser(self):
-        mock_factory, mock_browser, mock_bctx, _ = _make_body_playwright_mock(body_text="\n  \n")
-        with patch("playwright.async_api.async_playwright", mock_factory):
+    def test_drops_short_duplicates_and_hash_links_and_cleans_untrusted_text(self):
+        import config
+
+        long_title = ("A" * 180) + "\x00\x07\x1b" + ("B" * 80)
+        items = [
+            ("Too short", "https://example.org/short"),
+            ("Headline with hash link that is long enough", "#"),
+            ("Headline with empty link that is long enough", ""),
+            ("Valid AI headline number one for testing", "https://example.org/1"),
+            ("Valid AI headline number one for testing", "https://example.org/1-dup"),
+            ("Second\n\t  valid\x07 AI headline for testing", "https://example.org/2"),
+            (long_title, "https://example.org/3"),
+        ]
+        mock_factory, _, _ = _make_news_playwright_mock({
+            "https://example.org/ai": {"items": items},
+        })
+
+        with patch.object(config, "AI_NEWS_URLS", ["https://example.org/ai"]), \
+             patch("playwright.async_api.async_playwright", mock_factory):
             result = _run(self.plugin.execute())
 
-        self.assertFalse(result.success)
-        mock_bctx.close.assert_awaited_once()
-        mock_browser.close.assert_not_awaited()
-
-    def test_timeout_returns_error_and_closes_browser(self):
-        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-
-        mock_factory, mock_browser, mock_bctx, _ = _make_body_playwright_mock(
-            goto_side_effect=PlaywrightTimeoutError("Timeout")
-        )
-        with patch("playwright.async_api.async_playwright", mock_factory):
-            result = _run(self.plugin.execute())
-
-        self.assertFalse(result.success)
-        self.assertIn("timed out", result.output.lower())
-        mock_bctx.close.assert_awaited_once()
-        mock_browser.close.assert_not_awaited()
+        self.assertTrue(result.success)
+        self.assertLessEqual(len(result.output), 1500)
+        self.assertNotIn("Too short", result.output)
+        self.assertNotIn("#", result.output)
+        self.assertNotIn("1-dup", result.output)
+        self.assertNotIn("\x00", result.output)
+        self.assertNotIn("\x07", result.output)
+        self.assertNotIn("\x1b", result.output)
+        self.assertIn("2. Second valid AI headline for testing - https://example.org/2", result.output)
+        lines = result.output.split("\n")
+        third_title = lines[2].split(" - https://example.org/3")[0].removeprefix("3. ")
+        self.assertLessEqual(len(third_title), 200)
 
 
 class TestTelegramHITLCallback(unittest.TestCase):
