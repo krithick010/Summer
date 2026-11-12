@@ -176,6 +176,7 @@ HISTORY_DB_PATH=:memory:
 | `OLLAMA_NUM_CTX` | `4096` | Context window size in tokens |
 | `LLM_MAX_TOKENS` | `512` | Max generated tokens per reply |
 | `LLM_TEMPERATURE` | `0.6` | Sampling temperature |
+| `LLM_THINK` | *(empty)* | Set `false` (recommended for speed) or `true` on `qwen3`-family models; omit when empty |
 | `EXTRACTOR_MODEL` | `qwen2.5:3b` | Model used for background memory extraction |
 | `EXTRACTOR_ENABLED`| `true` | Enable/disable background memory extraction |
 | `DATA_DIR` | `data` | Base directory for application data |

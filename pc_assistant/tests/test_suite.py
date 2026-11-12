@@ -42,6 +42,7 @@ os.environ["AI_NEWS_URLS"] = (
     "https://techcrunch.com/category/artificial-intelligence/,"
     "https://venturebeat.com/category/ai/"
 )
+os.environ["LLM_THINK"] = ""
 
 # ---------------------------------------------------------------------------
 # Silence noisy third-party warnings so test output stays readable
@@ -525,6 +526,49 @@ class TestLLMEngine(unittest.TestCase):
         self.assertEqual(ext_payload["options"]["temperature"], 0)
         self.assertEqual(ext_payload["options"]["num_predict"], 200)
         self.assertIn("format", ext_payload)
+
+    @patch("httpx.AsyncClient.post")
+    def test_llm_think_flag_in_chat_and_extractor(self, mock_post):
+        import config
+        from core.extractor import extract_facts
+        from core.llm_engine import LLMEngine
+
+        chat_resp = MagicMock()
+        chat_resp.raise_for_status = MagicMock()
+        chat_resp.json.return_value = {"message": {"role": "assistant", "content": "Hi"}}
+
+        ext_resp = MagicMock()
+        ext_resp.raise_for_status = MagicMock()
+        ext_resp.json.return_value = {"message": {"content": '{"facts": []}'}}
+
+        engine = LLMEngine()
+
+        # Empty LLM_THINK -> omit "think"
+        mock_post.reset_mock()
+        mock_post.side_effect = [chat_resp, ext_resp]
+        with patch.object(config, "LLM_THINK", ""):
+            _run(engine.chat(messages=[{"role": "user", "content": "Hi"}]))
+            _run(extract_facts([], "Hi"))
+        self.assertNotIn("think", mock_post.call_args_list[0][1]["json"])
+        self.assertNotIn("think", mock_post.call_args_list[1][1]["json"])
+
+        # Explicit false -> "think": False
+        mock_post.reset_mock()
+        mock_post.side_effect = [chat_resp, ext_resp]
+        with patch.object(config, "LLM_THINK", "false"):
+            _run(engine.chat(messages=[{"role": "user", "content": "Hi"}]))
+            _run(extract_facts([], "Hi"))
+        self.assertIs(mock_post.call_args_list[0][1]["json"]["think"], False)
+        self.assertIs(mock_post.call_args_list[1][1]["json"]["think"], False)
+
+        # Explicit true -> "think": True
+        mock_post.reset_mock()
+        mock_post.side_effect = [chat_resp, ext_resp]
+        with patch.object(config, "LLM_THINK", "true"):
+            _run(engine.chat(messages=[{"role": "user", "content": "Hi"}]))
+            _run(extract_facts([], "Hi"))
+        self.assertIs(mock_post.call_args_list[0][1]["json"]["think"], True)
+        self.assertIs(mock_post.call_args_list[1][1]["json"]["think"], True)
 
 
 class TestOrchestrator(unittest.TestCase):

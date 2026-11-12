@@ -72,6 +72,8 @@ OLLAMA_KEEP_ALIVE: str = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "512"))
 # Temperature for LLM generation
 LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.6"))
+# Optional top-level "think" flag for qwen3-family reasoning models ("true", "false", or empty)
+LLM_THINK: str = os.getenv("LLM_THINK", "").strip().lower()
 # Model used by the background memory extractor (defaults to chat model)
 EXTRACTOR_MODEL: str = os.getenv("EXTRACTOR_MODEL", OLLAMA_MODEL)
 # Enable/disable background memory extraction

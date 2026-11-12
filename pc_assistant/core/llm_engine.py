@@ -25,6 +25,16 @@ def _ns_to_ms(value: Any) -> float | None:
     return None
 
 
+def resolve_llm_think() -> bool | None:
+    """Return True/False when config.LLM_THINK is explicitly set, else None."""
+    val = (getattr(config, "LLM_THINK", "") or "").strip().lower()
+    if val == "true":
+        return True
+    if val == "false":
+        return False
+    return None
+
+
 def log_ollama_timing(
     logger: logging.Logger,
     kind: str,
@@ -76,6 +86,9 @@ class LLMEngine:
         }
         if tools:
             payload["tools"] = tools
+        think = resolve_llm_think()
+        if think is not None:
+            payload["think"] = think
 
         t0 = time.perf_counter()
         async with httpx.AsyncClient(timeout=120) as c:

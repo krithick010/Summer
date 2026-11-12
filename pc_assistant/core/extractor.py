@@ -1,7 +1,7 @@
 import json, logging, re, time, httpx
 import config
 from config import OLLAMA_BASE_URL, EXTRACTOR_MODEL
-from core.llm_engine import log_ollama_timing
+from core.llm_engine import log_ollama_timing, resolve_llm_think
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +76,9 @@ async def extract_facts(history, message):
                "keep_alive": config.OLLAMA_KEEP_ALIVE,
                "messages": [{"role": "user", "content": prompt}],
                "options": {"temperature": 0, "num_ctx": config.OLLAMA_NUM_CTX, "num_predict": 200}}
+    think = resolve_llm_think()
+    if think is not None:
+        payload["think"] = think
     t0 = time.perf_counter()
     async with httpx.AsyncClient(timeout=60) as c:
         r = await c.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
