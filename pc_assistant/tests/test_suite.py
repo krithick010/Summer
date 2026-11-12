@@ -2111,6 +2111,25 @@ class TestConfigEnvExampleSanity(unittest.TestCase):
         missing = vars_in_config - vars_in_example
         self.assertEqual(missing, set(), f"Variables in config.py missing from .env.example: {missing}")
 
+        for expected_web_var in ("USER_LOCATION", "BROWSER_HEADLESS", "AI_NEWS_URLS"):
+            self.assertIn(expected_web_var, vars_in_example)
+
+    def test_web_plugin_docs_cover_settings_and_debugging(self):
+        repo_root = ROOT.parent
+        readme_text = (repo_root / "README.md").read_text(encoding="utf-8")
+        plugins_doc_text = (repo_root / "docs" / "PLUGINS.md").read_text(encoding="utf-8")
+        example_text = (ROOT / ".env.example").read_text(encoding="utf-8")
+
+        for doc_text in (readme_text, plugins_doc_text, example_text):
+            for required in (
+                "USER_LOCATION",
+                "BROWSER_HEADLESS",
+                "AI_NEWS_URLS",
+                "playwright install chromium",
+                "data/debug",
+            ):
+                self.assertIn(required, doc_text)
+
 
 class TestFastAPIApp(unittest.TestCase):
     """Test FastAPI endpoints using TestClient with mocked Telegram network initialization."""

@@ -63,7 +63,9 @@ python -m venv .venv
 source .venv/bin/activate
 
 pip install -r requirements.txt
+playwright install chromium
 ```
+*(The one-time `playwright install chromium` command downloads the Chromium binary used by the read-only web plugins.)*
 
 ### 3. Configure Environment Variables
 Copy `.env.example` to `.env`:
@@ -149,6 +151,12 @@ To run conversation history strictly in-memory without saving turns to disk:
 HISTORY_DB_PATH=:memory:
 ```
 
+### Web Plugins & Browser Debugging
+- **One-Time Browser Setup**: Run `playwright install chromium` after installing Python dependencies.
+- **Visible Browser Mode**: Set `BROWSER_HEADLESS=false` in `.env` if you want a visible Chromium window so you can watch web plugins navigate.
+- **Debug Screenshots**: On any web plugin failure (timeout, HTTP error, CAPTCHA redirect, or empty/unmatched page), Summer saves a diagnostic PNG under `data/debug/` (retaining the newest 10 files).
+- **Swappable News Sources**: Website layouts change over time — you can reorder or swap the comma-separated `AI_NEWS_URLS` list in `.env` without editing code.
+
 ---
 
 ## ⚙️ Configuration Reference
@@ -159,6 +167,9 @@ HISTORY_DB_PATH=:memory:
 | `ALLOWED_USER_IDS` | *Required* | Comma-separated Telegram user IDs authorized to use the bot |
 | `USER_NAME` | `friend` | Name the assistant uses to address you |
 | `ASSISTANT_NAME` | `Summer` | Persona name of the assistant |
+| `USER_LOCATION` | *(empty)* | Optional home location (e.g. `City, Region, Country`) for weather & local queries |
+| `BROWSER_HEADLESS` | `true` | Run Chromium headlessly (`true`) or set to `false` so you can watch the browser |
+| `AI_NEWS_URLS` | TechCrunch AI, VentureBeat AI | Comma-separated AI news URLs tried in order (swappable in `.env` if pages change) |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama service base URL |
 | `OLLAMA_MODEL` | `qwen2.5:3b` | Primary chat LLM model |
 | `OLLAMA_NUM_CTX` | `4096` | Context window size in tokens |

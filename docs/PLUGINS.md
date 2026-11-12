@@ -70,3 +70,16 @@ When `requires_approval = True`:
 5. The result is appended to SQLite history as a `role: tool` message, and `resume_tool_loop()` is invoked to deliver the final assistant response.
 6. When the user taps **Cancel**, the action is cancelled and no changes are executed.
 
+---
+
+## 4. Built-in Web Plugins (Playwright)
+
+Read-only web plugins (`get_weather`, `get_ai_news`, `search_wikipedia`) use a real Chromium browser powered by Playwright (`plugins/web_scraper.py`):
+
+- **One-Time Setup**: Install the Chromium browser binary once via `playwright install chromium`.
+- **Shared Browser Layer**: One Chromium browser starts lazily per process and stays open until shutdown; each plugin request creates an isolated browser context, aborts heavy assets (`image`, `media`, `font`), and always closes its context afterward.
+- **Watch the Browser (`BROWSER_HEADLESS`)**: Defaults to `true` (background headless). Set `BROWSER_HEADLESS=false` in `.env` so you can watch the visible Chromium window while debugging.
+- **Home Location (`USER_LOCATION`)**: `get_weather` uses an explicit city argument if given, or falls back to `USER_LOCATION` (and asks which city to check if neither is set).
+- **Multi-Source AI News (`AI_NEWS_URLS`)**: `get_ai_news` tries each comma-separated URL in `AI_NEWS_URLS` in order until one yields at least 3 clean headlines. Because live web pages change over time, you can swap or reorder `AI_NEWS_URLS` in `.env` anytime without touching code.
+- **Debug Screenshots (`data/debug/`)**: When a web lookup fails (timeout, HTTP `>= 400`, CAPTCHA redirect, empty page, or missing headlines), a screenshot is saved under `data/debug/` (the newest 10 files are kept; `data/` is git-ignored) and logged for inspection.
+
