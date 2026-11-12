@@ -18,6 +18,18 @@ python -u tests/test_suite.py
 - Always mock external APIs (Ollama, ChromaDB, Telegram, Google/Gmail).
 - Use temporary directories (`tempfile.mkdtemp()`) or in-memory databases (`HISTORY_DB_PATH=":memory:"`) so local files and user data are never touched.
 
+## Evaluating Tool Calling Locally (Dev)
+
+When iterating on prompts, tool schemas, or local models with a running Ollama instance, use the standalone tool-evaluation harness (not run in CI):
+
+```bash
+cd pc_assistant
+python scripts/tool_check.py
+python scripts/tool_check.py --model qwen3:4b
+```
+
+`scripts/tool_check.py` runs canned prompts through the real `Orchestrator` against your live Ollama server while stubbing plugin `execute()` calls (no browser, Gmail, or network requests) and writing only to a temporary `DATA_DIR` with `:memory:` history.
+
 ## Adding a Plugin
 
 1. Create a new module inside `pc_assistant/plugins/` prefixed with `p_` (e.g., `p_weather.py`).

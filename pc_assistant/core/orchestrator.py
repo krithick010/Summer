@@ -13,6 +13,7 @@ import importlib
 import inspect
 import logging
 import pkgutil
+import time
 from typing import Any, Callable
 
 import config
@@ -166,103 +167,115 @@ class Orchestrator:
         if not message:
             return ""
 
-        hist = self.history.get(user_id)
+        t_msg = time.perf_counter()
+        retrieval_ms = 0.0
+        try:
+            hist = self.history.get(user_id)
 
-        # Split-query retrieval: short follow-ups get two queries for context
-        last_user = next((m.get("content", "") for m in reversed(hist) if m.get("role") == "user"), "")
-        queries = [message]
-        if last_user and len(message.split()) < 6:
-            queries.append(last_user)
+            # Split-query retrieval: short follow-ups get two queries for context
+            t_ret = time.perf_counter()
+            last_user = next((m.get("content", "") for m in reversed(hist) if m.get("role") == "user"), "")
+            queries = [message]
+            if last_user and len(message.split()) < 6:
+                queries.append(last_user)
 
-        seen: list[str] = []
-        for q in queries:
-            result = await self.memory.asearch_memory(q, k=MEMORY_TOP_K)
-            for line in result.split("\n"):
-                if line and line not in seen:
-                    seen.append(line)
-            if len(seen) >= MEMORY_TOP_K:
-                break
-        memories = "\n".join(seen[:MEMORY_TOP_K])
+            seen: list[str] = []
+            for q in queries:
+                result = await self.memory.asearch_memory(q, k=MEMORY_TOP_K)
+                for line in result.split("\n"):
+                    if line and line not in seen:
+                        seen.append(line)
+                if len(seen) >= MEMORY_TOP_K:
+                    break
+            memories = "\n".join(seen[:MEMORY_TOP_K])
+            retrieval_ms = (time.perf_counter() - t_ret) * 1000.0
 
-        msgs: list[dict[str, Any]] = [
-            {"role": "system", "content": build_system_prompt(memories)}
-        ]
-        msgs += hist + [{"role": "user", "content": message}]
+            msgs: list[dict[str, Any]] = [
+                {"role": "system", "content": build_system_prompt(memories)}
+            ]
+            msgs += hist + [{"role": "user", "content": message}]
 
-        # Hide save_memory from the chat model — extraction is handled by background extractor
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": p.name,
-                    "description": p.description,
-                    "parameters": p.parameters_schema,
-                },
-            }
-            for p in self.registry.values()
-            if p.name != "save_memory"
-        ]
-
-        reply = await self.llm.chat(msgs, tools=tools)
-        log.info("tool_calls=%s", reply.get("tool_calls"))
-
-        for _ in range(3):  # tool loop
-            calls = reply.get("tool_calls")
-            if not calls:
-                break
-            msgs.append(reply)
-            for call in calls:
-                name = call["function"]["name"]
-                call_args = call["function"]["arguments"] or {}
-                plugin = self.registry.get(name)
-                if plugin is None:
-                    msgs.append({"role": "tool", "tool_name": name, "content": "unknown tool"})
-                    continue
-
-                allowed = plugin.parameters_schema.get("properties", {})
-                filtered_args = {k: v for k, v in call_args.items() if k in allowed} if allowed else {}
-
-                if plugin.requires_approval:
-                    preview = "\n".join(f"• {k}: {v}" for k, v in filtered_args.items())
-                    action = self.state_manager.create_action(
-                        tool_name=name,
-                        kwargs=filtered_args,
-                        description=preview,
-                        user_id=user_id,
-                    )
-                    # Preserve context: record user prompt and assistant tool_calls in history
-                    self.history.add(user_id, "user", message)
-                    assistant_turn = dict(reply)
-                    if "role" not in assistant_turn:
-                        assistant_turn["role"] = "assistant"
-                    self.history.add(user_id, assistant_turn)
-
-                    if self._hitl_builder is None:
-                        log.error("HITL builder not set — cannot pause for approval.")
-                        return "⚠️ Internal configuration error: HITL builder not registered."
-                    return self._hitl_builder(
-                        approval_id=action.approval_id,
-                        preview_text=preview,
-                        tool_name=name,
-                    )
-
-                res = await self.run_tool(name, filtered_args, chat_id)
-                msgs.append({"role": "tool", "tool_name": name, "content": res.output})
+            # Hide save_memory from the chat model — extraction is handled by background extractor
+            tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": p.name,
+                        "description": p.description,
+                        "parameters": p.parameters_schema,
+                    },
+                }
+                for p in self.registry.values()
+                if p.name != "save_memory"
+            ]
 
             reply = await self.llm.chat(msgs, tools=tools)
             log.info("tool_calls=%s", reply.get("tool_calls"))
 
-        text = (reply.get("content") or "").strip() or "Hmm, say that again?"
-        self.history.add(user_id, "user", message)
-        self.history.add(user_id, "assistant", text)
+            for _ in range(3):  # tool loop
+                calls = reply.get("tool_calls")
+                if not calls:
+                    break
+                msgs.append(reply)
+                for call in calls:
+                    name = call["function"]["name"]
+                    call_args = call["function"]["arguments"] or {}
+                    plugin = self.registry.get(name)
+                    if plugin is None:
+                        msgs.append({"role": "tool", "tool_name": name, "content": "unknown tool"})
+                        continue
 
-        # Background memory extraction — never affects the reply
-        if EXTRACTOR_ENABLED:
-            task = asyncio.create_task(self._remember(hist, message))
-            self._bg_tasks.add(task)
-            task.add_done_callback(self._bg_tasks.discard)
+                    allowed = plugin.parameters_schema.get("properties", {})
+                    filtered_args = {k: v for k, v in call_args.items() if k in allowed} if allowed else {}
 
-        return text
+                    if plugin.requires_approval:
+                        preview = "\n".join(f"• {k}: {v}" for k, v in filtered_args.items())
+                        action = self.state_manager.create_action(
+                            tool_name=name,
+                            kwargs=filtered_args,
+                            description=preview,
+                            user_id=user_id,
+                        )
+                        # Preserve context: record user prompt and assistant tool_calls in history
+                        self.history.add(user_id, "user", message)
+                        assistant_turn = dict(reply)
+                        if "role" not in assistant_turn:
+                            assistant_turn["role"] = "assistant"
+                        self.history.add(user_id, assistant_turn)
+
+                        if self._hitl_builder is None:
+                            log.error("HITL builder not set — cannot pause for approval.")
+                            return "⚠️ Internal configuration error: HITL builder not registered."
+                        return self._hitl_builder(
+                            approval_id=action.approval_id,
+                            preview_text=preview,
+                            tool_name=name,
+                        )
+
+                    res = await self.run_tool(name, filtered_args, chat_id)
+                    msgs.append({"role": "tool", "tool_name": name, "content": res.output})
+
+                reply = await self.llm.chat(msgs, tools=tools)
+                log.info("tool_calls=%s", reply.get("tool_calls"))
+
+            text = (reply.get("content") or "").strip() or "Hmm, say that again?"
+            self.history.add(user_id, "user", message)
+            self.history.add(user_id, "assistant", text)
+
+            # Background memory extraction — never affects the reply
+            if EXTRACTOR_ENABLED:
+                task = asyncio.create_task(self._remember(hist, message))
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
+
+            return text
+        finally:
+            total_ms = (time.perf_counter() - t_msg) * 1000.0
+            log.info(
+                "Orchestrator timing | retrieval_ms=%.1f handle_user_message_ms=%.1f",
+                retrieval_ms,
+                total_ms,
+            )
 
     async def _remember(self, hist: list[dict[str, Any]], message: str) -> None:
         """Background task: extract facts from the conversation and upsert them."""

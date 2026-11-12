@@ -399,6 +399,101 @@ class TestLLMEngine(unittest.TestCase):
         with self.assertRaises(httpx.HTTPError):
             _run(engine.chat(messages=[{"role": "user", "content": "Hi"}]))
 
+    @patch("httpx.AsyncClient.post")
+    def test_chat_logs_ollama_timing_and_tolerates_missing_fields(self, mock_post):
+        from core.llm_engine import LLMEngine
+
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "model": "qwen2.5:3b",
+            "load_duration": 125_000_000,
+            "prompt_eval_count": 42,
+            "eval_count": 11,
+            "total_duration": 850_000_000,
+            "message": {"role": "assistant", "content": "Hi!"},
+        }
+        mock_post.return_value = mock_resp
+
+        engine = LLMEngine()
+        with self.assertLogs("core.llm_engine", level="INFO") as cm:
+            _run(engine.chat(messages=[{"role": "user", "content": "Hi"}]))
+
+        timing_lines = [line for line in cm.output if "Ollama chat |" in line]
+        self.assertEqual(len(timing_lines), 1)
+        line = timing_lines[0]
+        self.assertIn("model=qwen2.5:3b", line)
+        self.assertIn("load_duration_ms=125.0", line)
+        self.assertIn("prompt_eval_count=42", line)
+        self.assertIn("eval_count=11", line)
+        self.assertIn("total_ms=850.0", line)
+
+        # Missing duration/count fields are tolerated gracefully
+        mock_resp.json.return_value = {"message": {"role": "assistant", "content": "Ok"}}
+        with self.assertLogs("core.llm_engine", level="INFO") as cm2:
+            _run(engine.chat(messages=[{"role": "user", "content": "Ok"}]))
+        line2 = [line for line in cm2.output if "Ollama chat |" in line][0]
+        self.assertIn("load_duration_ms=na", line2)
+        self.assertIn("total_ms=", line2)
+
+    @patch("httpx.AsyncClient.post")
+    def test_extractor_logs_ollama_timing(self, mock_post):
+        from core.extractor import extract_facts
+
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "model": "qwen2.5:3b",
+            "load_duration": 10_000_000,
+            "prompt_eval_count": 88,
+            "eval_count": 9,
+            "total_duration": 210_000_000,
+            "message": {"content": '{"facts": []}'},
+        }
+        mock_post.return_value = mock_resp
+
+        with self.assertLogs("core.extractor", level="INFO") as cm:
+            facts = _run(extract_facts([], "hello there"))
+
+        self.assertEqual(facts, [])
+        timing_lines = [line for line in cm.output if "Ollama extractor |" in line]
+        self.assertEqual(len(timing_lines), 1)
+        self.assertIn("load_duration_ms=10.0", timing_lines[0])
+        self.assertIn("prompt_eval_count=88", timing_lines[0])
+        self.assertIn("eval_count=9", timing_lines[0])
+        self.assertIn("total_ms=210.0", timing_lines[0])
+
+    def test_orchestrator_logs_retrieval_and_total_timing(self):
+        from core.orchestrator import Orchestrator
+
+        with patch.object(Orchestrator, "_load_plugins", lambda self: None):
+            orch = Orchestrator()
+        orch.memory = MagicMock()
+        orch.memory.asearch_memory = AsyncMock(return_value="")
+        orch.llm = MagicMock()
+        orch.llm.chat = AsyncMock(return_value={"role": "assistant", "content": "Hi!"})
+
+        with patch("core.orchestrator.EXTRACTOR_ENABLED", False), \
+             self.assertLogs("core.orchestrator", level="INFO") as cm:
+            reply = _run(orch.handle_user_message(1, 1, "hello"))
+
+        self.assertEqual(reply, "Hi!")
+        timing_lines = [line for line in cm.output if "Orchestrator timing |" in line]
+        self.assertEqual(len(timing_lines), 1)
+        self.assertIn("retrieval_ms=", timing_lines[0])
+        self.assertIn("handle_user_message_ms=", timing_lines[0])
+
+    def test_import_scripts_tool_check_without_side_effects(self):
+        import importlib
+
+        before_data = os.environ.get("DATA_DIR")
+        before_hist = os.environ.get("HISTORY_DB_PATH")
+        mod = importlib.import_module("scripts.tool_check")
+        self.assertTrue(hasattr(mod, "main"))
+        self.assertEqual(len(mod._build_single_turn_cases()), 14)
+        self.assertEqual(os.environ.get("DATA_DIR"), before_data)
+        self.assertEqual(os.environ.get("HISTORY_DB_PATH"), before_hist)
+
 
 class TestOrchestrator(unittest.TestCase):
     """Test single-call conversational Orchestrator with native tool calling."""

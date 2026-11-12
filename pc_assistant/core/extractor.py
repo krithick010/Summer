@@ -1,5 +1,6 @@
-import json, logging, re, httpx
-from config import OLLAMA_BASE_URL, EXTRACTOR_MODEL
+import json, logging, re, time, httpx
+from config import OLLAMA_BASE_URL, EXTRACTOR_MODEL, OLLAMA_NUM_CTX
+from core.llm_engine import log_ollama_timing
 
 log = logging.getLogger(__name__)
 
@@ -72,11 +73,20 @@ async def extract_facts(history, message):
     prompt = PROMPT.replace("{context}", context).replace("{latest}", message)
     payload = {"model": EXTRACTOR_MODEL, "stream": False, "format": SCHEMA, "keep_alive": "30m",
                "messages": [{"role": "user", "content": prompt}],
-               "options": {"temperature": 0, "num_ctx": 2048, "num_predict": 200}}
+               "options": {"temperature": 0, "num_ctx": OLLAMA_NUM_CTX, "num_predict": 200}}
+    t0 = time.perf_counter()
     async with httpx.AsyncClient(timeout=60) as c:
         r = await c.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
         r.raise_for_status()
-    raw = json.loads(r.json()["message"]["content"]).get("facts", [])
+    data = r.json()
+    log_ollama_timing(
+        log,
+        "extractor",
+        data,
+        EXTRACTOR_MODEL,
+        (time.perf_counter() - t0) * 1000.0,
+    )
+    raw = json.loads(data["message"]["content"]).get("facts", [])
     facts = []
     for f in raw:
         cleaned = _clean(f, message)
