@@ -26,3 +26,7 @@ jsonschema==4.23.0
 # Vector Database & Long-Term Memory
 chromadb==1.5.9
 langchain-ollama==1.1.0
+
+# Browser Automation (p_wikipedia.py)
+# After installing requirements, run: playwright install chromium
+playwright==1.52.0

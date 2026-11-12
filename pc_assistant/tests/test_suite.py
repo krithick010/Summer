@@ -97,6 +97,18 @@ class TestImports(unittest.TestCase):
         from plugins.p_remember import RememberPlugin
         self.assertEqual(RememberPlugin().name, "save_memory")
 
+    def test_import_p_wikipedia(self):
+        from plugins.p_wikipedia import WikipediaPlugin
+        self.assertEqual(WikipediaPlugin().name, "search_wikipedia")
+
+    def test_import_p_weather(self):
+        from plugins.p_weather import WeatherPlugin
+        self.assertEqual(WeatherPlugin().name, "get_weather")
+
+    def test_import_p_ai_news(self):
+        from plugins.p_ai_news import AINewsPlugin
+        self.assertEqual(AINewsPlugin().name, "get_ai_news")
+
     def test_import_memory(self):
         from core.memory import MemoryManager
         self.assertTrue(callable(MemoryManager))
@@ -686,6 +698,9 @@ class TestOrchestrator(unittest.TestCase):
             self.assertIn("system_info", orch.registry)
             self.assertIn("send_email", orch.registry)
             self.assertIn("save_memory", orch.registry)
+            self.assertIn("search_wikipedia", orch.registry)
+            self.assertIn("get_weather", orch.registry)
+            self.assertIn("get_ai_news", orch.registry)
 
 
 class TestPluginAvailability(unittest.TestCase):
@@ -1265,6 +1280,357 @@ class TestGmailPluginValidation(unittest.TestCase):
         props = self.plugin.parameters_schema["properties"]
         for field in ("to_email", "subject", "body"):
             self.assertIn(field, props)
+
+
+class TestWikipediaPlugin(unittest.TestCase):
+    """Test WikipediaPlugin metadata and execution with mocked Playwright."""
+
+    def setUp(self):
+        from plugins.p_wikipedia import WikipediaPlugin
+        self.plugin = WikipediaPlugin()
+
+    @staticmethod
+    def _make_playwright_mock(paragraphs=None, goto_side_effect=None, wait_side_effect=None, status=200):
+        paragraphs = paragraphs or []
+        mock_locator = MagicMock()
+        mock_locator.count = AsyncMock(return_value=len(paragraphs))
+
+        def _nth(idx):
+            elem = MagicMock()
+            elem.inner_text = AsyncMock(return_value=paragraphs[idx])
+            return elem
+
+        mock_locator.nth = MagicMock(side_effect=_nth)
+
+        mock_resp = MagicMock()
+        mock_resp.status = status
+
+        mock_page = MagicMock()
+        mock_page.url = "https://en.wikipedia.org/wiki/Python_(programming_language)"
+        if goto_side_effect is not None:
+            mock_page.goto = AsyncMock(side_effect=goto_side_effect)
+        else:
+            mock_page.goto = AsyncMock(return_value=mock_resp)
+        if wait_side_effect is not None:
+            mock_page.wait_for_selector = AsyncMock(side_effect=wait_side_effect)
+        else:
+            mock_page.wait_for_selector = AsyncMock(return_value=None)
+        mock_page.locator = MagicMock(return_value=mock_locator)
+
+        mock_browser = MagicMock()
+        mock_browser.new_page = AsyncMock(return_value=mock_page)
+        mock_browser.close = AsyncMock()
+
+        mock_pw_obj = MagicMock()
+        mock_pw_obj.chromium.launch = AsyncMock(return_value=mock_browser)
+
+        mock_ctx = MagicMock()
+        mock_ctx.__aenter__ = AsyncMock(return_value=mock_pw_obj)
+        mock_ctx.__aexit__ = AsyncMock(return_value=False)
+
+        mock_factory = MagicMock(return_value=mock_ctx)
+        return mock_factory, mock_browser, mock_page
+
+    def test_schema_and_flags(self):
+        self.assertEqual(self.plugin.name, "search_wikipedia")
+        self.assertFalse(self.plugin.requires_approval)
+        self.assertIn("query", self.plugin.parameters_schema["required"])
+        self.assertEqual(self.plugin.parameters_schema["properties"]["query"]["type"], "string")
+
+    def test_empty_query_fails_without_launching_browser(self):
+        with patch("playwright.async_api.async_playwright") as mock_pw:
+            result = _run(self.plugin.execute(query="   "))
+            self.assertFalse(result.success)
+            mock_pw.assert_not_called()
+
+    def test_successful_wikipedia_lookup_extracts_summary_and_closes_browser(self):
+        mock_factory, mock_browser, mock_page = self._make_playwright_mock(
+            paragraphs=[
+                "Python is a high-level, general-purpose programming language.",
+                "Its design philosophy emphasizes code readability.",
+            ]
+        )
+        with patch("playwright.async_api.async_playwright", mock_factory):
+            result = _run(self.plugin.execute(query="Python programming"))
+
+        self.assertTrue(result.success)
+        self.assertIn("Python is a high-level, general-purpose programming language.", result.output)
+        self.assertIn("Its design philosophy emphasizes code readability.", result.output)
+        goto_url = mock_page.goto.call_args[0][0]
+        self.assertEqual(goto_url, "https://en.wikipedia.org/w/index.php?search=Python%20programming")
+        mock_browser.close.assert_awaited_once()
+
+    def test_timeout_returns_error_and_closes_browser(self):
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+        mock_factory, mock_browser, _ = self._make_playwright_mock(
+            goto_side_effect=PlaywrightTimeoutError("Navigation timeout")
+        )
+        with patch("playwright.async_api.async_playwright", mock_factory):
+            result = _run(self.plugin.execute(query="Albert Einstein"))
+
+        self.assertFalse(result.success)
+        self.assertIn("timed out", result.output.lower())
+        mock_browser.close.assert_awaited_once()
+
+    def test_missing_summary_returns_error_and_closes_browser(self):
+        mock_factory, mock_browser, _ = self._make_playwright_mock(paragraphs=[])
+        with patch("playwright.async_api.async_playwright", mock_factory):
+            result = _run(self.plugin.execute(query="NonExistentTopicXYZ123"))
+
+        self.assertFalse(result.success)
+        self.assertIn("No Wikipedia", result.output)
+        mock_browser.close.assert_awaited_once()
+
+
+def _make_body_playwright_mock(
+    body_text="",
+    headlines=None,
+    goto_side_effect=None,
+    status=200,
+    url="https://example.com",
+):
+    """Create mocked async_playwright context/browser/page returning ``body_text`` and optional headlines."""
+    headlines = headlines or []
+
+    mock_body = MagicMock()
+    mock_body.inner_text = AsyncMock(return_value=body_text)
+
+    mock_headlines = MagicMock()
+    mock_headlines.count = AsyncMock(return_value=len(headlines))
+
+    def _nth_headline(idx):
+        elem = MagicMock()
+        elem.inner_text = AsyncMock(return_value=headlines[idx])
+        return elem
+
+    mock_headlines.nth = MagicMock(side_effect=_nth_headline)
+
+    def _locator(sel):
+        return mock_body if sel == "body" else mock_headlines
+
+    mock_resp = MagicMock()
+    mock_resp.status = status
+
+    mock_page = MagicMock()
+    mock_page.url = url
+    if goto_side_effect is not None:
+        mock_page.goto = AsyncMock(side_effect=goto_side_effect)
+    else:
+        mock_page.goto = AsyncMock(return_value=mock_resp)
+    mock_page.locator = MagicMock(side_effect=_locator)
+
+    mock_browser_ctx = MagicMock()
+    mock_browser_ctx.new_page = AsyncMock(return_value=mock_page)
+    mock_browser_ctx.close = AsyncMock()
+
+    mock_browser = MagicMock()
+    mock_browser.new_context = AsyncMock(return_value=mock_browser_ctx)
+    mock_browser.close = AsyncMock()
+
+    mock_pw_obj = MagicMock()
+    mock_pw_obj.chromium.launch = AsyncMock(return_value=mock_browser)
+
+    mock_ctx = MagicMock()
+    mock_ctx.__aenter__ = AsyncMock(return_value=mock_pw_obj)
+    mock_ctx.__aexit__ = AsyncMock(return_value=False)
+
+    return MagicMock(return_value=mock_ctx), mock_browser, mock_browser_ctx, mock_page
+
+
+class TestWebScraper(unittest.TestCase):
+    """Test shared Playwright web_scraper protections."""
+
+    def test_captcha_redirect_returns_blocked_result(self):
+        from plugins.web_scraper import scrape_page_body
+
+        for blocked_url in (
+            "https://www.google.com/sorry/index?continue=...",
+            "https://example.com/captcha-verify",
+        ):
+            mock_factory, mock_browser, mock_bctx, _ = _make_body_playwright_mock(
+                body_text="captcha challenge",
+                url=blocked_url,
+            )
+            with patch("playwright.async_api.async_playwright", mock_factory):
+                result = _run(
+                    scrape_page_body("https://example.com", max_chars=1000, label="Test")
+                )
+
+            self.assertFalse(result.success)
+            self.assertEqual(result.output, "⚠️ Blocked by CAPTCHA.")
+            self.assertEqual(result.error, "CAPTCHA redirect detected")
+            mock_bctx.close.assert_awaited_once()
+            mock_browser.close.assert_awaited_once()
+
+
+class TestWeatherPlugin(unittest.TestCase):
+    """Test WeatherPlugin metadata and wttr.in scraping with mocked Playwright."""
+
+    def setUp(self):
+        from plugins.p_weather import WeatherPlugin
+        self.plugin = WeatherPlugin()
+
+    def test_schema_and_flags(self):
+        self.assertEqual(self.plugin.name, "get_weather")
+        self.assertFalse(self.plugin.requires_approval)
+        self.assertEqual(self.plugin.parameters_schema["required"], [])
+        loc_schema = self.plugin.parameters_schema["properties"]["location"]
+        self.assertEqual(loc_schema["type"], "string")
+        self.assertIn("Madurai", loc_schema["description"])
+        self.assertNotIn("London", loc_schema["description"])
+
+    def test_empty_or_missing_location_defaults_to_madurai(self):
+        for kwargs in ({}, {"location": "   "}):
+            mock_factory, mock_browser, mock_bctx, mock_page = _make_body_playwright_mock(
+                body_text="Weather report: Madurai +31°C Clear",
+                url="https://wttr.in/Madurai?0T",
+            )
+            with patch("playwright.async_api.async_playwright", mock_factory):
+                result = _run(self.plugin.execute(**kwargs))
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.data["location"], "Madurai")
+            self.assertEqual(
+                mock_page.goto.call_args[0][0],
+                "https://wttr.in/Madurai?0T",
+            )
+            mock_bctx.close.assert_awaited_once()
+            mock_browser.close.assert_awaited_once()
+
+    def test_weather_uses_wttr_in_user_agent_cleans_and_truncates_to_1500(self):
+        long_body = "New York\n\n15C   Sunny\n" + ("forecast " * 300)
+        mock_factory, mock_browser, mock_bctx, mock_page = _make_body_playwright_mock(
+            body_text=long_body,
+            url="https://wttr.in/New%20York?0T",
+        )
+        with patch("playwright.async_api.async_playwright", mock_factory):
+            result = _run(self.plugin.execute(location="New York"))
+
+        self.assertTrue(result.success)
+        self.assertNotIn("\n", result.output)
+        self.assertEqual(len(result.output), 1500)
+        self.assertTrue(result.output.startswith("New York 15C Sunny"))
+        self.assertEqual(
+            mock_page.goto.call_args[0][0],
+            "https://wttr.in/New%20York?0T",
+        )
+        self.assertEqual(mock_page.goto.call_args[1]["wait_until"], "domcontentloaded")
+        ua = mock_browser.new_context.call_args[1]["user_agent"]
+        self.assertIn("Chrome/120.0.0.0", ua)
+        mock_page.locator.assert_called_with("body")
+        mock_bctx.close.assert_awaited_once()
+        mock_browser.close.assert_awaited_once()
+
+    def test_weather_empty_body_returns_error(self):
+        mock_factory, mock_browser, mock_bctx, _ = _make_body_playwright_mock(body_text="   \n\n  ")
+        with patch("playwright.async_api.async_playwright", mock_factory):
+            result = _run(self.plugin.execute(location="Tokyo"))
+
+        self.assertFalse(result.success)
+        self.assertIn("empty", result.output.lower())
+        mock_bctx.close.assert_awaited_once()
+        mock_browser.close.assert_awaited_once()
+
+    def test_weather_timeout_returns_error_and_closes_browser(self):
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+        mock_factory, mock_browser, mock_bctx, _ = _make_body_playwright_mock(
+            goto_side_effect=PlaywrightTimeoutError("Timed out")
+        )
+        with patch("playwright.async_api.async_playwright", mock_factory):
+            result = _run(self.plugin.execute(location="Paris"))
+
+        self.assertFalse(result.success)
+        self.assertIn("timed out", result.output.lower())
+        mock_bctx.close.assert_awaited_once()
+        mock_browser.close.assert_awaited_once()
+
+
+class TestAINewsPlugin(unittest.TestCase):
+    """Test AINewsPlugin metadata and TechCrunch AI scraping with mocked Playwright."""
+
+    def setUp(self):
+        from plugins.p_ai_news import AINewsPlugin
+        self.plugin = AINewsPlugin()
+
+    def test_schema_and_flags(self):
+        self.assertEqual(self.plugin.name, "get_ai_news")
+        self.assertFalse(self.plugin.requires_approval)
+        self.assertEqual(self.plugin.parameters_schema["type"], "object")
+        self.assertEqual(self.plugin.parameters_schema["required"], [])
+
+    def test_scrapes_techcrunch_top_5_headlines_and_closes_browser(self):
+        headlines = [
+            "OpenAI announces model update",
+            "Anthropic expands enterprise tooling",
+            "Google DeepMind publishes robotics paper",
+            "Meta releases open weights benchmark",
+            "NVIDIA unveils next-gen inference chip",
+            "Sixth headline should be excluded",
+        ]
+        mock_factory, mock_browser, mock_bctx, mock_page = _make_body_playwright_mock(
+            headlines=headlines,
+            url="https://techcrunch.com/category/artificial-intelligence/",
+        )
+        with patch("playwright.async_api.async_playwright", mock_factory):
+            result = _run(self.plugin.execute())
+
+        self.assertTrue(result.success)
+        lines = result.output.split("\n")
+        self.assertEqual(len(lines), 5)
+        self.assertEqual(lines[0], "1. OpenAI announces model update")
+        self.assertEqual(lines[4], "5. NVIDIA unveils next-gen inference chip")
+        self.assertEqual(
+            mock_page.goto.call_args[0][0],
+            "https://techcrunch.com/category/artificial-intelligence/",
+        )
+        self.assertEqual(mock_page.goto.call_args[1]["wait_until"], "domcontentloaded")
+        ua = mock_browser.new_context.call_args[1]["user_agent"]
+        self.assertIn("Chrome/120.0.0.0", ua)
+        mock_page.locator.assert_called_with("h2, h3")
+        mock_bctx.close.assert_awaited_once()
+        mock_browser.close.assert_awaited_once()
+
+    def test_falls_back_to_body_truncated_to_2500(self):
+        long_news = "AI Daily\n\nTop Story\n" + ("article " * 500)
+        mock_factory, mock_browser, mock_bctx, mock_page = _make_body_playwright_mock(
+            body_text=long_news,
+            headlines=[],
+            url="https://techcrunch.com/category/artificial-intelligence/",
+        )
+        with patch("playwright.async_api.async_playwright", mock_factory):
+            result = _run(self.plugin.execute())
+
+        self.assertTrue(result.success)
+        self.assertNotIn("\n", result.output)
+        self.assertEqual(len(result.output), 2500)
+        self.assertTrue(result.output.startswith("AI Daily Top Story"))
+        mock_bctx.close.assert_awaited_once()
+        mock_browser.close.assert_awaited_once()
+
+    def test_no_results_returns_error_and_closes_browser(self):
+        mock_factory, mock_browser, mock_bctx, _ = _make_body_playwright_mock(body_text="\n  \n")
+        with patch("playwright.async_api.async_playwright", mock_factory):
+            result = _run(self.plugin.execute())
+
+        self.assertFalse(result.success)
+        mock_bctx.close.assert_awaited_once()
+        mock_browser.close.assert_awaited_once()
+
+    def test_timeout_returns_error_and_closes_browser(self):
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+        mock_factory, mock_browser, mock_bctx, _ = _make_body_playwright_mock(
+            goto_side_effect=PlaywrightTimeoutError("Timeout")
+        )
+        with patch("playwright.async_api.async_playwright", mock_factory):
+            result = _run(self.plugin.execute())
+
+        self.assertFalse(result.success)
+        self.assertIn("timed out", result.output.lower())
+        mock_bctx.close.assert_awaited_once()
+        mock_browser.close.assert_awaited_once()
 
 
 class TestTelegramHITLCallback(unittest.TestCase):
