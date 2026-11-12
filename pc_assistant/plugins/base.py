@@ -150,6 +150,10 @@ class PluginBase(abc.ABC):
             Standardised result container.
         """
 
+    async def prepare_preview(self, kwargs: dict[str, Any]) -> str | None:
+        """Optional hook to build a rich human-readable HITL preview before approval."""
+        return None
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------

@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -322,6 +323,37 @@ async def handle_callback_query(
                 )
             else:
                 result = None
+
+            # 2. Upload files if the approved plugin returned send_files
+            if (
+                result
+                and result.success
+                and isinstance(result.data, dict)
+                and "send_files" in result.data
+            ):
+                send_files = result.data.get("send_files") or []
+                for item in send_files:
+                    f_path = Path(item["path"])
+                    kind = item.get("kind", "document")
+                    filename = item.get("filename") or f_path.name
+                    try:
+                        if f_path.exists():
+                            with open(f_path, "rb") as f:
+                                if kind == "photo":
+                                    await context.bot.send_photo(
+                                        chat_id=query.message.chat_id,
+                                        photo=f,
+                                        caption=filename,
+                                    )
+                                else:
+                                    await context.bot.send_document(
+                                        chat_id=query.message.chat_id,
+                                        document=f,
+                                        filename=filename,
+                                    )
+                    finally:
+                        if item.get("cleanup"):
+                            f_path.unlink(missing_ok=True)
 
             result_output = result.output if result else "Action completed."
 

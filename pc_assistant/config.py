@@ -129,6 +129,18 @@ GMAIL_SENDER_EMAIL: str = os.getenv("GMAIL_SENDER_EMAIL", "")
 HITL_TIMEOUT_SECONDS: int = int(os.getenv("HITL_TIMEOUT_SECONDS", "120"))
 
 # ---------------------------------------------------------------------------
+# File Sharing & Search
+# ---------------------------------------------------------------------------
+# Optional comma-separated root paths to search (empty = priority user folders then home)
+FILE_SEARCH_ROOTS: str = os.getenv("FILE_SEARCH_ROOTS", "")
+# Maximum file size (MB) sent directly over Telegram without compression or email routing
+FILE_TELEGRAM_MAX_MB: float = float(os.getenv("FILE_TELEGRAM_MAX_MB", "15.0"))
+# Maximum post-zip file size (MB) eligible for multi-part 45 MB chunks over Telegram
+FILE_MAX_SPLIT_MB: float = float(os.getenv("FILE_MAX_SPLIT_MB", "150.0"))
+# Default email address to send files to when delivery is email
+USER_DEFAULT_EMAIL: str = os.getenv("USER_DEFAULT_EMAIL", "")
+
+# ---------------------------------------------------------------------------
 # Vector Memory (ChromaDB + nomic-embed-text)
 # ---------------------------------------------------------------------------
 EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")

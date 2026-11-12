@@ -60,6 +60,10 @@ class GmailPlugin(PluginBase):
                 "type": "string",
                 "description": "Plain-text body content of the email",
             },
+            "attachment_path": {
+                "type": "string",
+                "description": "Optional local file path to attach to the email",
+            },
         },
         "required": ["to_email", "subject", "body"],
     }
@@ -130,6 +134,7 @@ class GmailPlugin(PluginBase):
         to_email: str = (kwargs.get("to_email") or kwargs.get("to") or "").strip()
         subject: str  = kwargs.get("subject",  "").strip()
         body: str     = kwargs.get("body",     "").strip()
+        attachment_path: str | None = kwargs.get("attachment_path")
 
         # Basic validation — the LLM should always pass these, but be safe
         missing = [f for f, v in [("to_email", to_email), ("subject", subject), ("body", body)] if not v]
@@ -143,7 +148,7 @@ class GmailPlugin(PluginBase):
         try:
             # Build + send in a thread (googleapiclient is blocking I/O)
             result = await asyncio.to_thread(
-                self._build_and_send, to_email, subject, body
+                self._build_and_send, to_email, subject, body, attachment_path
             )
             return result
         except FileNotFoundError as exc:
@@ -169,7 +174,13 @@ class GmailPlugin(PluginBase):
     # Blocking helper (runs inside asyncio.to_thread)
     # ------------------------------------------------------------------
 
-    def _build_and_send(self, to_email: str, subject: str, body: str) -> PluginResult:
+    def _build_and_send(
+        self,
+        to_email: str,
+        subject: str,
+        body: str,
+        attachment_path: str | None = None,
+    ) -> PluginResult:
         service = self._get_service()
 
         msg = EmailMessage()
@@ -180,18 +191,51 @@ class GmailPlugin(PluginBase):
         if GMAIL_SENDER_EMAIL:
             msg["From"] = GMAIL_SENDER_EMAIL
 
+        if attachment_path:
+            import mimetypes
+            import os
+
+            att = Path(attachment_path)
+            if not att.exists():
+                return PluginResult(
+                    success=False,
+                    output=f"⚠️ Attachment file not found: `{attachment_path}`",
+                    error=f"Attachment not found: {attachment_path}",
+                )
+            size_mb = os.path.getsize(str(att)) / (1024 * 1024)
+            if size_mb > 25.0:
+                return PluginResult(
+                    success=False,
+                    output=f"⚠️ Attachment '{att.name}' is {size_mb:.1f} MB (Gmail attachment limit is 25 MB).",
+                    error="Attachment exceeds Gmail 25 MB limit",
+                )
+            ctype, encoding = mimetypes.guess_type(str(att))
+            if ctype is None or encoding is not None:
+                ctype = "application/octet-stream"
+            maintype, subtype = ctype.split("/", 1)
+            msg.add_attachment(
+                att.read_bytes(),
+                maintype=maintype,
+                subtype=subtype,
+                filename=att.name,
+            )
+
         encoded = base64.urlsafe_b64encode(msg.as_bytes()).decode()
         service.users().messages().send(
             userId="me", body={"raw": encoded}
         ).execute()
 
-        log.info("Email sent to %s | subject: %r", to_email, subject)
+        log.info("Email sent to %s | subject: %r (attachment: %s)", to_email, subject, attachment_path)
+        att_line = f"\n📎 *Attachment:* `{Path(attachment_path).name}`" if attachment_path else ""
+        data: dict[str, Any] = {"to": to_email, "subject": subject}
+        if attachment_path:
+            data["attachment"] = str(attachment_path)
         return PluginResult(
             success=True,
             output=(
                 f"✅ Email sent successfully!\n\n"
                 f"📧 *To:* `{to_email}`\n"
-                f"📌 *Subject:* {subject}"
+                f"📌 *Subject:* {subject}{att_line}"
             ),
-            data={"to": to_email, "subject": subject},
+            data=data,
         )

@@ -267,7 +267,12 @@ class Orchestrator:
                     filtered_args = {k: v for k, v in call_args.items() if k in allowed} if allowed else {}
 
                     if plugin.requires_approval:
-                        preview = "\n".join(f"• {k}: {v}" for k, v in filtered_args.items())
+                        try:
+                            custom_preview = await plugin.prepare_preview(filtered_args)
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning("prepare_preview failed for %s: %s", name, exc)
+                            custom_preview = None
+                        preview = custom_preview or "\n".join(f"• {k}: {v}" for k, v in filtered_args.items())
                         action = self.state_manager.create_action(
                             tool_name=name,
                             kwargs=filtered_args,

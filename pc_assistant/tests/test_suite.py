@@ -116,6 +116,16 @@ class TestImports(unittest.TestCase):
         from plugins.p_ai_news import AINewsPlugin
         self.assertEqual(AINewsPlugin().name, "get_ai_news")
 
+    def test_import_file_search(self):
+        from plugins.file_search import find_files, is_sensitive_path
+        self.assertTrue(callable(find_files))
+        self.assertTrue(callable(is_sensitive_path))
+
+    def test_import_p_files(self):
+        from plugins.p_files import FindFilesPlugin, ShareFilePlugin
+        self.assertEqual(FindFilesPlugin().name, "find_files")
+        self.assertEqual(ShareFilePlugin().name, "share_file")
+
     def test_import_memory(self):
         from core.memory import MemoryManager
         self.assertTrue(callable(MemoryManager))
@@ -1559,7 +1569,7 @@ class TestGmailPluginValidation(unittest.TestCase):
 
     def test_all_required_params_in_schema(self):
         props = self.plugin.parameters_schema["properties"]
-        for field in ("to_email", "subject", "body"):
+        for field in ("to_email", "subject", "body", "attachment_path"):
             self.assertIn(field, props)
 
 
@@ -2660,6 +2670,415 @@ class TestFastAPIApp(unittest.TestCase):
         opts = mock_msg.reply_text.await_args.kwargs["link_preview_options"]
         self.assertIsInstance(opts, LinkPreviewOptions)
         self.assertTrue(opts.is_disabled)
+
+
+# ============================================================================
+# LAYER 4 — File Search, Compression, and Sharing Tests
+# ============================================================================
+
+class TestFileSearch(unittest.TestCase):
+    """Test plugins/file_search.py security boundaries, two-tier search, and zip/split helpers."""
+
+    def test_is_sensitive_path(self):
+        from plugins.file_search import is_sensitive_path
+        sensitive = [
+            ".env",
+            "project/.env",
+            "production.env",
+            "server.key",
+            "cert.pem",
+            "id_rsa",
+            "id_rsa.pub",
+            ".ssh/id_rsa",
+            "pc_assistant/credentials/gmail_oauth.json",
+            "credentials/gmail_token.json",
+            "data/history.db",
+            "data/memory_db/chroma.sqlite3",
+            "whatsapp_session/client.json",
+        ]
+        for s in sensitive:
+            self.assertTrue(is_sensitive_path(s), f"Expected {s} to be sensitive")
+
+        safe = [
+            "resume.pdf",
+            "quarterly_report.docx",
+            "screenshot.png",
+            "dataset.csv",
+            "notes.txt",
+            "src/main.py",
+        ]
+        for s in safe:
+            self.assertFalse(is_sensitive_path(s), f"Expected {s} to be safe")
+
+    def test_find_files_direct_path(self):
+        from plugins.file_search import find_files
+        with tempfile.TemporaryDirectory() as td:
+            safe_file = Path(td) / "safe_document.pdf"
+            safe_file.write_text("content")
+            res = find_files(str(safe_file))
+            self.assertEqual(len(res), 1)
+            self.assertEqual(res[0].resolve(), safe_file.resolve())
+
+            secret_file = Path(td) / ".env"
+            secret_file.write_text("SECRET=1")
+            res_blocked = find_files(str(secret_file))
+            self.assertEqual(res_blocked, [])
+
+    def test_find_files_fuzzy_tokens(self):
+        import config
+        from plugins.file_search import find_files
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "annual_financial_report_2026.pdf"
+            target.write_text("report")
+            other = Path(td) / "other_notes.txt"
+            other.write_text("notes")
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                res = find_files("financial report pdf")
+                self.assertGreaterEqual(len(res), 1)
+                self.assertEqual(res[0].resolve(), target.resolve())
+
+    def test_find_files_skips_noisy_directories(self):
+        import config
+        from plugins.file_search import find_files
+        with tempfile.TemporaryDirectory() as td:
+            git_dir = Path(td) / ".git"
+            git_dir.mkdir()
+            (git_dir / "invoice.pdf").write_text("hidden")
+
+            node_dir = Path(td) / "node_modules"
+            node_dir.mkdir()
+            (node_dir / "invoice.pdf").write_text("hidden")
+
+            valid_dir = Path(td) / "Documents"
+            valid_dir.mkdir()
+            valid_file = valid_dir / "invoice.pdf"
+            valid_file.write_text("visible")
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                res = find_files("invoice pdf")
+                self.assertEqual(len(res), 1)
+                self.assertEqual(res[0].resolve(), valid_file.resolve())
+
+    def test_compress_to_zip_and_split_chunks(self):
+        import os
+        import zipfile
+        from plugins.file_search import compress_to_zip, split_file_chunks
+        with tempfile.TemporaryDirectory() as td:
+            test_file = Path(td) / "sample_data.bin"
+            test_file.write_bytes(os.urandom(20_000))
+
+            zips_dir = Path(td) / "zips"
+            zip_path = compress_to_zip(test_file, zips_dir)
+            self.assertTrue(zip_path.exists())
+            self.assertTrue(zipfile.is_zipfile(zip_path))
+
+            # Split into 5 KB parts
+            parts = split_file_chunks(zip_path, chunk_size_mb=0.005)
+            self.assertFalse(zip_path.exists())
+            self.assertGreater(len(parts), 1)
+            for p in parts:
+                self.assertTrue(p.exists())
+                self.assertIn(".part", p.name)
+
+
+class TestFilesPlugins(unittest.TestCase):
+    """Test FindFilesPlugin and ShareFilePlugin execution, previews, and routing."""
+
+    def test_find_files_plugin_metadata_and_execute(self):
+        import config
+        from plugins.p_files import FindFilesPlugin
+        plugin = FindFilesPlugin()
+        self.assertEqual(plugin.name, "find_files")
+        self.assertFalse(plugin.requires_approval)
+        self.assertIn("query", plugin.parameters_schema["required"])
+
+        with tempfile.TemporaryDirectory() as td:
+            doc = Path(td) / "project_brief.pdf"
+            doc.write_text("brief content")
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                res = _run(plugin.execute(query="project brief"))
+                self.assertTrue(res.success)
+                self.assertIn("project_brief.pdf", res.output)
+                self.assertEqual(len(res.data["files"]), 1)
+
+    def test_share_file_plugin_metadata(self):
+        from plugins.p_files import ShareFilePlugin
+        plugin = ShareFilePlugin()
+        self.assertEqual(plugin.name, "share_file")
+        self.assertTrue(plugin.requires_approval)
+        self.assertIn("query", plugin.parameters_schema["required"])
+
+    def test_share_file_prepare_preview(self):
+        import config
+        from plugins.p_files import ShareFilePlugin
+        plugin = ShareFilePlugin()
+        with tempfile.TemporaryDirectory() as td:
+            doc = Path(td) / "statement.pdf"
+            doc.write_text("statement")
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                preview = _run(plugin.prepare_preview({"query": "statement"}))
+                self.assertIsNotNone(preview)
+                self.assertIn("• File:", preview)
+                self.assertIn("statement.pdf", preview)
+                self.assertIn("• Size:", preview)
+                self.assertIn("• Action:", preview)
+
+    def test_share_file_telegram_photo_route(self):
+        import config
+        from plugins.p_files import ShareFilePlugin
+        plugin = ShareFilePlugin()
+        with tempfile.TemporaryDirectory() as td:
+            img = Path(td) / "photo.jpg"
+            img.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                res = _run(plugin.execute(query="photo.jpg"))
+                self.assertTrue(res.success)
+                self.assertEqual(len(res.data["send_files"]), 1)
+                item = res.data["send_files"][0]
+                self.assertEqual(item["kind"], "photo")
+                self.assertFalse(item["cleanup"])
+
+    def test_share_file_telegram_document_route(self):
+        import config
+        from plugins.p_files import ShareFilePlugin
+        plugin = ShareFilePlugin()
+        with tempfile.TemporaryDirectory() as td:
+            doc = Path(td) / "document.pdf"
+            doc.write_text("pdf document content")
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                res = _run(plugin.execute(query="document.pdf"))
+                self.assertTrue(res.success)
+                self.assertEqual(len(res.data["send_files"]), 1)
+                item = res.data["send_files"][0]
+                self.assertEqual(item["kind"], "document")
+                self.assertFalse(item["cleanup"])
+
+    def test_share_file_folder_auto_zip(self):
+        import config
+        from plugins.p_files import ShareFilePlugin
+        plugin = ShareFilePlugin()
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td) / "project_folder"
+            folder.mkdir()
+            (folder / "file.txt").write_text("hello")
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                res = _run(plugin.execute(query=str(folder)))
+                self.assertTrue(res.success)
+                item = res.data["send_files"][0]
+                self.assertEqual(item["kind"], "document")
+                self.assertTrue(item["cleanup"])
+                self.assertTrue(item["path"].endswith(".zip"))
+                self.assertTrue(Path(item["path"]).exists())
+                # Clean up test temp zip
+                Path(item["path"]).unlink(missing_ok=True)
+
+    def test_share_file_email_route(self):
+        import config
+        from plugins.p_files import ShareFilePlugin
+        from plugins.base import PluginResult
+        plugin = ShareFilePlugin()
+        with tempfile.TemporaryDirectory() as td:
+            doc = Path(td) / "contract.pdf"
+            doc.write_text("contract")
+
+            mock_gmail = MagicMock()
+            mock_gmail.is_available.return_value = True
+            mock_gmail.execute = AsyncMock(return_value=PluginResult(success=True, output="Email sent!"))
+
+            with patch("plugins.p_gmail.GmailPlugin", return_value=mock_gmail):
+                with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                    res = _run(plugin.execute(query="contract.pdf", delivery="email", to_email="partner@example.com"))
+                    self.assertTrue(res.success)
+                    mock_gmail.execute.assert_awaited_once()
+                    self.assertEqual(mock_gmail.execute.call_args.kwargs["to_email"], "partner@example.com")
+                    self.assertIn("contract.pdf", mock_gmail.execute.call_args.kwargs["attachment_path"])
+
+    def test_share_file_auto_email_route_15_to_25mb(self):
+        import config
+        from plugins.p_files import ShareFilePlugin
+        from plugins.base import PluginResult
+        plugin = ShareFilePlugin()
+        with tempfile.TemporaryDirectory() as td:
+            doc = Path(td) / "heavy_report.pdf"
+            doc.write_bytes(b"0" * 100)
+
+            mock_gmail = MagicMock()
+            mock_gmail.is_available.return_value = True
+            mock_gmail.execute = AsyncMock(return_value=PluginResult(success=True, output="Email sent!"))
+
+            with patch("plugins.p_gmail.GmailPlugin", return_value=mock_gmail):
+                with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                    with patch.object(config, "USER_DEFAULT_EMAIL", "default@example.com"):
+                        with patch("os.path.getsize", return_value=20 * 1024 * 1024):
+                            res = _run(plugin.execute(query="heavy_report.pdf", delivery="auto"))
+                            self.assertTrue(res.success)
+                            mock_gmail.execute.assert_awaited_once()
+
+    def test_share_file_oversized_split_telegram(self):
+        import config
+        from plugins.p_files import ShareFilePlugin
+        plugin = ShareFilePlugin()
+        with tempfile.TemporaryDirectory() as td:
+            doc = Path(td) / "large_archive.dat"
+            doc.write_bytes(b"0" * 100)
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                with patch("plugins.p_files.compress_to_zip") as mock_zip:
+                    zip_mock = Path(td) / "large_archive.dat.zip"
+                    zip_mock.write_bytes(b"123")
+                    mock_zip.return_value = zip_mock
+
+                    with patch("plugins.p_files.split_file_chunks") as mock_split:
+                        part1 = Path(td) / "part.01"
+                        part2 = Path(td) / "part.02"
+                        part1.write_bytes(b"1")
+                        part2.write_bytes(b"2")
+                        mock_split.return_value = [part1, part2]
+
+                        with patch("os.path.getsize", return_value=60 * 1024 * 1024):
+                            res = _run(plugin.execute(query="large_archive.dat"))
+                            self.assertTrue(res.success)
+                            self.assertEqual(len(res.data["send_files"]), 2)
+                            self.assertTrue(all(item["cleanup"] for item in res.data["send_files"]))
+
+    def test_share_file_too_large_fails(self):
+        import config
+        from plugins.p_files import ShareFilePlugin
+        plugin = ShareFilePlugin()
+        with tempfile.TemporaryDirectory() as td:
+            doc = Path(td) / "massive.iso"
+            doc.write_bytes(b"0" * 100)
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                with patch("plugins.p_files.compress_to_zip") as mock_zip:
+                    zip_mock = Path(td) / "massive.iso.zip"
+                    zip_mock.write_bytes(b"123")
+                    mock_zip.return_value = zip_mock
+
+                    with patch("os.path.getsize", return_value=200 * 1024 * 1024):
+                        res = _run(plugin.execute(query="massive.iso"))
+                        self.assertFalse(res.success)
+                        self.assertIn("too large", res.output.lower())
+
+
+class TestGmailPluginAttachment(unittest.TestCase):
+    """Test Gmail plugin attachments and 25 MB ceiling."""
+
+    def test_gmail_plugin_with_attachment(self):
+        from plugins.p_gmail import GmailPlugin
+        plugin = GmailPlugin()
+
+        with tempfile.TemporaryDirectory() as td:
+            att = Path(td) / "document.pdf"
+            att.write_bytes(b"%PDF-1.4 sample content")
+
+            with patch.object(plugin, "_get_service") as mock_svc:
+                mock_send = MagicMock()
+                mock_svc.return_value.users.return_value.messages.return_value.send.return_value = mock_send
+
+                res = _run(plugin.execute(
+                    to_email="test@example.com",
+                    subject="Doc",
+                    body="Hello",
+                    attachment_path=str(att),
+                ))
+                self.assertTrue(res.success)
+                self.assertIn("Attachment:", res.output)
+                self.assertEqual(res.data["attachment"], str(att))
+                mock_send.execute.assert_called_once()
+
+    def test_gmail_plugin_attachment_over_25mb_fails(self):
+        from plugins.p_gmail import GmailPlugin
+        plugin = GmailPlugin()
+
+        with tempfile.TemporaryDirectory() as td:
+            att = Path(td) / "huge.pdf"
+            att.write_bytes(b"0" * 100)
+
+            with patch("os.path.getsize", return_value=26 * 1024 * 1024):
+                res = _run(plugin.execute(
+                    to_email="test@example.com",
+                    subject="Doc",
+                    body="Hello",
+                    attachment_path=str(att),
+                ))
+                self.assertFalse(res.success)
+                self.assertIn("25 MB", res.output)
+
+
+class TestTelegramCallbackFileDelivery(unittest.TestCase):
+    """Test handle_callback_query uploading send_files and cleaning up temp archives in finally."""
+
+    def test_callback_sends_files_and_cleans_up(self):
+        import main
+        from plugins.base import PluginResult
+
+        with tempfile.TemporaryDirectory() as td:
+            photo_file = Path(td) / "pic.png"
+            photo_file.write_bytes(b"fake photo")
+
+            temp_zip = Path(td) / "archive.zip"
+            temp_zip.write_bytes(b"fake zip")
+
+            fake_result = PluginResult(
+                success=True,
+                output="Files ready.",
+                data={
+                    "send_files": [
+                        {"path": str(photo_file), "filename": "pic.png", "kind": "photo", "cleanup": False},
+                        {"path": str(temp_zip), "filename": "archive.zip", "kind": "document", "cleanup": True},
+                    ]
+                },
+            )
+
+            mock_plugin = MagicMock()
+            mock_plugin.execute = AsyncMock(return_value=fake_result)
+
+            mock_sm = MagicMock()
+            mock_sm.resolve.return_value = {
+                "tool_name": "share_file",
+                "kwargs": {"query": "test"},
+            }
+
+            mock_orch = MagicMock()
+            mock_orch.registry = {"share_file": mock_plugin}
+            mock_orch.state_manager = mock_sm
+            mock_orch.history.get.return_value = []
+            mock_orch.resume_tool_loop = AsyncMock(return_value="Here are your files!")
+
+            mock_query = MagicMock()
+            mock_query.from_user.id = 1
+            mock_query.data = "hitl:approve:action123"
+            mock_query.message.chat_id = 123
+            mock_query.answer = AsyncMock()
+            mock_query.edit_message_text = AsyncMock()
+
+            mock_context = MagicMock()
+            mock_context.bot.send_photo = AsyncMock()
+            mock_context.bot.send_document = AsyncMock()
+            mock_context.bot.send_message = AsyncMock()
+
+            mock_update = MagicMock()
+            mock_update.callback_query = mock_query
+
+            with patch.object(main, "_orchestrator", mock_orch):
+                with patch.object(main, "_is_allowed", return_value=True):
+                    with patch("core.state_manager.state_manager", mock_sm):
+                        _run(main.handle_callback_query(mock_update, mock_context))
+
+            # Verified bot sent photo and document
+            mock_context.bot.send_photo.assert_awaited_once()
+            mock_context.bot.send_document.assert_awaited_once()
+
+            # Verified photo (cleanup=False) remains, while temp_zip (cleanup=True) was deleted
+            self.assertTrue(photo_file.exists())
+            self.assertFalse(temp_zip.exists())
 
 
 if __name__ == "__main__":
