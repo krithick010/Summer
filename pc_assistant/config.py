@@ -104,7 +104,7 @@ AI_NEWS_URLS: list[str] = [
 # ---------------------------------------------------------------------------
 # Conversation History & Context
 # ---------------------------------------------------------------------------
-HISTORY_TURNS: int = int(os.getenv("HISTORY_TURNS", "8"))
+HISTORY_TURNS: int = int(os.getenv("HISTORY_TURNS", "10"))
 
 # ---------------------------------------------------------------------------
 # Google / Gmail

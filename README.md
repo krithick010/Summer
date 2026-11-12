@@ -182,7 +182,7 @@ HISTORY_DB_PATH=:memory:
 | `DATA_DIR` | `data` | Base directory for application data |
 | `HISTORY_DB_PATH` | `data/history.db` | SQLite history database path (or `:memory:`) |
 | `MEMORY_DB_PATH` | `data/memory_db` | ChromaDB vector storage folder |
-| `HISTORY_TURNS` | `8` | Number of recent conversation turns kept in context |
+| `HISTORY_TURNS` | `10` | Number of recent conversation turns kept in context |
 | `EMBEDDING_MODEL` | `nomic-embed-text` | Ollama embedding model |
 | `MEMORY_TOP_K` | `5` | Maximum number of memories retrieved per query |
 | `MEMORY_MAX_DISTANCE`| `1.3` | Semantic distance threshold for retrieval |

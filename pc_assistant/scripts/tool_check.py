@@ -62,6 +62,43 @@ def _build_single_turn_cases() -> list[EvalCase]:
     ]
 
 
+def _build_multi_turn_scenarios() -> list[tuple[str, list[EvalCase]]]:
+    return [
+        (
+            "repeat ai news",
+            [
+                EvalCase("any ai news?", "get_ai_news"),
+                EvalCase("give me ai news again", "get_ai_news"),
+                EvalCase("more", "get_ai_news"),
+            ],
+        ),
+        (
+            "weather follow-ups",
+            [
+                EvalCase("how's the weather?", "get_weather"),
+                EvalCase(
+                    "and in Paris?",
+                    "get_weather",
+                    lambda calls: any(
+                        "paris" in str(args).lower()
+                        for name, args in calls
+                        if name == "get_weather"
+                    ),
+                    note="args mention Paris",
+                ),
+                EvalCase("what about now?", "get_weather"),
+            ],
+        ),
+        (
+            "chat without tools",
+            [
+                EvalCase("hi", None),
+                EvalCase("what's my mom's number?", None),
+            ],
+        ),
+    ]
+
+
 def _setup_hermetic_env(tmpdir: str, model_override: str | None) -> None:
     """Configure temp storage env vars before importing ``config``."""
     pc_assistant_dir = str(Path(__file__).resolve().parent.parent)
@@ -194,6 +231,31 @@ async def _run_eval(model_override: str | None) -> int:
 
         _print_table(rows, f"Single-Turn Eval (model={config.OLLAMA_MODEL})")
         print(f"\n{correct}/{len(cases)} correct")
+
+        scenarios = _build_multi_turn_scenarios()
+        mt_rows: list[tuple[str, str, str, str, bool]] = []
+        mt_correct = 0
+        mt_total = 0
+
+        for label, turns in scenarios:
+            orch.history.clear(uid)
+            for idx, case in enumerate(turns, start=1):
+                mt_total += 1
+                recorded_calls.clear()
+                t0 = time.perf_counter()
+                await orch.handle_user_message(uid, uid, case.message)
+                elapsed = time.perf_counter() - t0
+                passed = _matches_case(case, recorded_calls)
+                if passed:
+                    mt_correct += 1
+                exp_label = case.expected_tool or "none"
+                if case.note:
+                    exp_label = f"{exp_label} ({case.note})"
+                actual_label = ", ".join(f"{n}({a})" if a else n for n, a in recorded_calls) or "none"
+                mt_rows.append((f"[{label} #{idx}] {case.message}", exp_label, actual_label, f"{elapsed:.2f}", passed))
+
+        _print_table(mt_rows, f"Multi-Turn Eval (model={config.OLLAMA_MODEL})")
+        print(f"\n{mt_correct}/{mt_total} correct")
         orch.history.close()
         return 0
 

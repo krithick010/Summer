@@ -69,7 +69,12 @@ def _clean(f: dict, latest: str):
 
 
 async def extract_facts(history, message):
-    recent = [m for m in history if m.get("role") in ("user", "assistant") and m.get("content")][-4:]
+    recent = [
+        m for m in history
+        if m.get("role") in ("user", "assistant")
+        and m.get("content")
+        and not m.get("tool_calls")
+    ][-4:]
     context = "\n".join(f'{m["role"]}: {m["content"]}' for m in recent) or "(none)"
     prompt = PROMPT.replace("{context}", context).replace("{latest}", message)
     payload = {"model": EXTRACTOR_MODEL, "stream": False, "format": SCHEMA,

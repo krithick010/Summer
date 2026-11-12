@@ -637,6 +637,64 @@ class TestOrchestrator(unittest.TestCase):
         self.assertEqual(result, "Got it, I've noted down your mom's number.")
         fake_plugin.execute.assert_called_once_with(fact="Mom's number is 555-0123")
 
+    def test_tool_trace_stored_truncated_and_seen_on_next_turn(self):
+        from plugins.base import PluginResult
+        orch = self._make_orch()
+        orch.memory = MagicMock()
+        orch.memory.asearch_memory = AsyncMock(return_value="")
+
+        fake_plugin = MagicMock()
+        fake_plugin.name = "get_weather"
+        fake_plugin.description = "weather"
+        fake_plugin.usage_hint = ""
+        fake_plugin.requires_approval = False
+        fake_plugin.parameters_schema = {
+            "type": "object",
+            "properties": {"location": {"type": "string"}},
+            "required": [],
+        }
+        long_output = "Paris forecast: " + ("rainy " * 120)
+        self.assertGreater(len(long_output), 500)
+        fake_plugin.execute = AsyncMock(return_value=PluginResult(success=True, output=long_output))
+        orch.registry["get_weather"] = fake_plugin
+
+        captured_msgs = []
+
+        async def _fake_chat(msgs, tools=None):
+            captured_msgs.append([dict(m) for m in msgs])
+            if len(captured_msgs) == 1:
+                return {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"function": {"name": "get_weather", "arguments": {"location": "Paris"}}}
+                    ],
+                }
+            if len(captured_msgs) == 2:
+                return {"role": "assistant", "content": "It is rainy in Paris."}
+            return {"role": "assistant", "content": "Still rainy."}
+
+        orch.llm = MagicMock()
+        orch.llm.chat = AsyncMock(side_effect=_fake_chat)
+
+        first = _run(orch.handle_user_message(user_id=7, chat_id=7, message="weather in Paris"))
+        self.assertEqual(first, "It is rainy in Paris.")
+        # Live turn saw the full >500-char tool output
+        self.assertEqual(captured_msgs[1][-1]["role"], "tool")
+        self.assertEqual(captured_msgs[1][-1]["content"], long_output)
+
+        hist = orch.history.get(7)
+        self.assertEqual([m["role"] for m in hist], ["user", "assistant", "tool", "assistant"])
+        self.assertIn("tool_calls", hist[1])
+        self.assertEqual(hist[2]["tool_name"], "get_weather")
+        self.assertEqual(len(hist[2]["content"]), 500)
+        self.assertEqual(hist[2]["content"], long_output[:500])
+
+        second = _run(orch.handle_user_message(user_id=7, chat_id=7, message="what about now?"))
+        self.assertEqual(second, "Still rainy.")
+        turn2_roles = [m["role"] for m in captured_msgs[2]]
+        self.assertEqual(turn2_roles, ["system", "user", "assistant", "tool", "assistant", "user"])
+
     def test_hitl_send_email_returns_dict_and_does_not_execute(self):
         from plugins.base import PluginResult
         orch = self._make_orch()
@@ -1308,6 +1366,31 @@ class TestExtractor(unittest.TestCase):
         msg = "phone is 9876543210"
         facts = _run(extract_facts([], msg))
         self.assertEqual(facts, [])
+
+    @patch("httpx.AsyncClient.post")
+    def test_extract_facts_skips_tool_and_tool_calls_messages(self, mock_post):
+        from core.extractor import extract_facts
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"message": {"content": json.dumps({"facts": []})}}
+        mock_post.return_value = mock_resp
+
+        history = [
+            {"role": "user", "content": "any ai news?"},
+            {
+                "role": "assistant",
+                "content": "checking_tool_marker",
+                "tool_calls": [{"function": {"name": "get_ai_news", "arguments": {}}}],
+            },
+            {"role": "tool", "tool_name": "get_ai_news", "content": "tool_output_marker"},
+            {"role": "assistant", "content": "Here are the headlines."},
+        ]
+        _run(extract_facts(history, "thanks"))
+        sent_prompt = mock_post.call_args.kwargs["json"]["messages"][0]["content"]
+        self.assertIn("user: any ai news?", sent_prompt)
+        self.assertIn("assistant: Here are the headlines.", sent_prompt)
+        self.assertNotIn("checking_tool_marker", sent_prompt)
+        self.assertNotIn("tool_output_marker", sent_prompt)
 
     @patch("httpx.AsyncClient.post")
     def test_malformed_json_raises_json_decode_error(self, mock_post):

@@ -244,17 +244,23 @@ class Orchestrator:
             reply = await self.llm.chat(msgs, tools=tools)
             log.info("tool_calls=%s", reply.get("tool_calls"))
 
+            tool_trace: list[dict] = []
             for _ in range(3):  # tool loop
                 calls = reply.get("tool_calls")
                 if not calls:
                     break
                 msgs.append(reply)
+                assistant_turn = dict(reply)
+                assistant_turn.setdefault("role", "assistant")
+                tool_trace.append(assistant_turn)
                 for call in calls:
                     name = call["function"]["name"]
                     call_args = call["function"]["arguments"] or {}
                     plugin = self.registry.get(name)
                     if plugin is None:
-                        msgs.append({"role": "tool", "tool_name": name, "content": "unknown tool"})
+                        tool_msg = {"role": "tool", "tool_name": name, "content": "unknown tool"}
+                        msgs.append(tool_msg)
+                        tool_trace.append(tool_msg)
                         continue
 
                     allowed = plugin.parameters_schema.get("properties", {})
@@ -270,9 +276,6 @@ class Orchestrator:
                         )
                         # Preserve context: record user prompt and assistant tool_calls in history
                         self.history.add(user_id, "user", message)
-                        assistant_turn = dict(reply)
-                        if "role" not in assistant_turn:
-                            assistant_turn["role"] = "assistant"
                         self.history.add(user_id, assistant_turn)
 
                         if self._hitl_builder is None:
@@ -286,12 +289,19 @@ class Orchestrator:
 
                     res = await self.run_tool(name, filtered_args, chat_id)
                     msgs.append({"role": "tool", "tool_name": name, "content": res.output})
+                    tool_trace.append({
+                        "role": "tool",
+                        "tool_name": name,
+                        "content": (res.output or "")[:500],
+                    })
 
                 reply = await self.llm.chat(msgs, tools=tools)
                 log.info("tool_calls=%s", reply.get("tool_calls"))
 
             text = (reply.get("content") or "").strip() or "Hmm, say that again?"
             self.history.add(user_id, "user", message)
+            for entry in tool_trace:
+                self.history.add(user_id, entry)
             self.history.add(user_id, "assistant", text)
 
             # Background memory extraction — never affects the reply
