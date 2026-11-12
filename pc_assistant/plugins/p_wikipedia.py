@@ -1,7 +1,7 @@
 """
 plugins/p_wikipedia.py
 ----------------------
-Read-only Wikipedia search plugin using Playwright headless Chromium.
+Read-only Wikipedia search plugin using the shared Playwright browser layer.
 
 Before using this plugin, install the Chromium browser binary once:
     playwright install chromium
@@ -15,6 +15,7 @@ import urllib.parse
 from typing import Any
 
 from plugins.base import PluginBase, PluginResult
+from plugins.web_scraper import run_in_page
 
 log = logging.getLogger(__name__)
 
@@ -115,7 +116,10 @@ async def _extract_article_summary(page: Any, query: str) -> PluginResult:
         if len(collected) >= 3:
             break
 
-    summary = _first_sentences(collected)
+    final_url = page.url
+    suffix = f"\n{final_url}"
+    summary_budget = max(100, _MAX_OUTPUT_CHARS - len(suffix))
+    summary = _first_sentences(collected, max_chars=summary_budget)
     if not summary:
         return PluginResult(
             success=False,
@@ -123,11 +127,11 @@ async def _extract_article_summary(page: Any, query: str) -> PluginResult:
             error=f"No summary paragraphs found at {page.url}",
         )
 
-    final_url = page.url
+    output = f"{summary}{suffix}"
     log.info("Wikipedia summary fetched for %r (%s)", query, final_url)
     return PluginResult(
         success=True,
-        output=summary,
+        output=output,
         data={"query": query, "url": final_url},
     )
 
@@ -153,7 +157,7 @@ class WikipediaPlugin(PluginBase):
     requires_approval = False
 
     async def execute(self, **kwargs: Any) -> PluginResult:
-        """Navigate to Wikipedia via headless Chromium and extract 2-3 lead sentences."""
+        """Navigate to Wikipedia via the shared Playwright browser and extract 2-3 lead sentences."""
         query = str(kwargs.get("query", "")).strip()
         if not query:
             return PluginResult(
@@ -162,60 +166,30 @@ class WikipediaPlugin(PluginBase):
                 error="Missing required 'query' parameter.",
             )
 
-        from playwright.async_api import (
-            TimeoutError as PlaywrightTimeoutError,
-            async_playwright,
-        )
-
         search_url = (
             f"https://en.wikipedia.org/w/index.php?search={urllib.parse.quote(query)}&go=Go"
         )
 
-        browser = None
-        try:
-            async with async_playwright() as p:
-                try:
-                    browser = await p.chromium.launch(
-                        headless=True,
-                        args=["--disable-gpu"],
-                    )
-                    page = await browser.new_page()
+        async def _handler(page: Any, _response: Any) -> PluginResult:
+            return await _extract_article_summary(page, query)
 
-                    response = await page.goto(
-                        search_url,
-                        wait_until="domcontentloaded",
-                        timeout=_NAVIGATION_TIMEOUT_MS,
-                    )
-                    if response is not None and response.status >= 400:
-                        return PluginResult(
-                            success=False,
-                            output=f"Wikipedia returned HTTP {response.status} for '{query}'.",
-                            error=f"HTTP {response.status} when loading {search_url}",
-                        )
-
-                    return await _extract_article_summary(page, query)
-                finally:
-                    if browser is not None:
-                        await browser.close()
-
-        except PlaywrightTimeoutError as exc:
-            log.warning("Wikipedia lookup timed out for %r: %s", query, exc)
-            return PluginResult(
-                success=False,
-                output=f"Wikipedia lookup timed out for '{query}'. Please try again.",
-                error=str(exc),
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Wikipedia lookup failed for %r: %s", query, exc)
-            msg = str(exc)
-            if "Executable doesn't exist" in msg:
+        result = await run_in_page(
+            search_url,
+            label=f"wikipedia-{query}",
+            handler=_handler,
+        )
+        if not result.success and result.error:
+            err_lower = result.error.lower()
+            if "executable doesn't exist" in err_lower:
                 return PluginResult(
                     success=False,
                     output="Wikipedia search needs `playwright install chromium` first.",
-                    error=msg,
+                    error=result.error,
                 )
-            return PluginResult(
-                success=False,
-                output=f"Couldn't look up '{query}' on Wikipedia right now.",
-                error=msg,
-            )
+            if "timed out" in err_lower or "timeout" in err_lower:
+                return PluginResult(
+                    success=False,
+                    output=f"Wikipedia lookup timed out for '{query}'. Please try again.",
+                    error=result.error,
+                )
+        return result

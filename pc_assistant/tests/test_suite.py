@@ -1570,6 +1570,10 @@ class TestWikipediaPlugin(unittest.TestCase):
         from plugins.p_wikipedia import WikipediaPlugin
         self.plugin = WikipediaPlugin()
 
+    def tearDown(self):
+        from plugins.web_scraper import close_browser
+        _run(close_browser())
+
     @staticmethod
     def _make_playwright_mock(
         pages_by_url=None,
@@ -1581,6 +1585,7 @@ class TestWikipediaPlugin(unittest.TestCase):
         pages_by_url = pages_by_url or {}
         default_spec = {
             "final_url": "https://en.wikipedia.org/wiki/Python_(programming_language)",
+            "title": "Python (programming language) - Wikipedia",
             "paragraphs": paragraphs if paragraphs is not None else [],
             "search_links": [],
             "disambig": False,
@@ -1591,6 +1596,9 @@ class TestWikipediaPlugin(unittest.TestCase):
 
         mock_page = MagicMock()
         mock_page.url = default_spec["final_url"]
+        mock_page.title = AsyncMock(side_effect=lambda: current_spec.get("title", "Wikipedia"))
+        mock_page.route = AsyncMock()
+        mock_page.screenshot = AsyncMock()
 
         async def _goto(url, **_kwargs):
             if goto_side_effect is not None:
@@ -1638,19 +1646,26 @@ class TestWikipediaPlugin(unittest.TestCase):
             mock_page.wait_for_selector = AsyncMock(return_value=None)
         mock_page.locator = MagicMock(side_effect=_locator)
 
+        mock_browser_ctx = MagicMock()
+        mock_browser_ctx.new_page = AsyncMock(return_value=mock_page)
+        mock_browser_ctx.close = AsyncMock()
+
         mock_browser = MagicMock()
-        mock_browser.new_page = AsyncMock(return_value=mock_page)
+        mock_browser.new_context = AsyncMock(return_value=mock_browser_ctx)
         mock_browser.close = AsyncMock()
+        mock_browser.is_connected = MagicMock(return_value=True)
 
         mock_pw_obj = MagicMock()
         mock_pw_obj.chromium.launch = AsyncMock(return_value=mock_browser)
+        mock_pw_obj.stop = AsyncMock()
 
         mock_ctx = MagicMock()
+        mock_ctx.start = AsyncMock(return_value=mock_pw_obj)
         mock_ctx.__aenter__ = AsyncMock(return_value=mock_pw_obj)
         mock_ctx.__aexit__ = AsyncMock(return_value=False)
 
         mock_factory = MagicMock(return_value=mock_ctx)
-        return mock_factory, mock_browser, mock_page
+        return mock_factory, mock_browser, mock_browser_ctx, mock_page
 
     def test_schema_and_flags(self):
         self.assertEqual(self.plugin.name, "search_wikipedia")
@@ -1665,7 +1680,7 @@ class TestWikipediaPlugin(unittest.TestCase):
             mock_pw.assert_not_called()
 
     def test_successful_wikipedia_lookup_extracts_summary_and_closes_browser(self):
-        mock_factory, mock_browser, mock_page = self._make_playwright_mock(
+        mock_factory, mock_browser, mock_browser_ctx, mock_page = self._make_playwright_mock(
             paragraphs=[
                 "",
                 "Python is a high-level programming language[1]. Its design philosophy emphasizes readability[2]. It supports multiple paradigms.",
@@ -1679,6 +1694,7 @@ class TestWikipediaPlugin(unittest.TestCase):
         self.assertIn("Python is a high-level programming language.", result.output)
         self.assertIn("Its design philosophy emphasizes readability.", result.output)
         self.assertIn("It supports multiple paradigms.", result.output)
+        self.assertIn("https://en.wikipedia.org/wiki/Python_(programming_language)", result.output)
         self.assertNotIn("Fourth sentence", result.output)
         self.assertNotIn("[1]", result.output)
         self.assertNotIn("[2]", result.output)
@@ -1688,12 +1704,12 @@ class TestWikipediaPlugin(unittest.TestCase):
             goto_url,
             "https://en.wikipedia.org/w/index.php?search=Python%20programming&go=Go",
         )
-        mock_browser.close.assert_awaited_once()
+        mock_browser_ctx.close.assert_awaited_once()
 
     def test_search_results_page_follows_first_result(self):
         search_url = "https://en.wikipedia.org/w/index.php?search=Alan%20Turing&go=Go"
         article_url = "https://en.wikipedia.org/wiki/Alan_Turing"
-        mock_factory, mock_browser, _ = self._make_playwright_mock(
+        mock_factory, _mock_browser, mock_browser_ctx, _ = self._make_playwright_mock(
             pages_by_url={
                 search_url: {
                     "final_url": search_url,
@@ -1713,14 +1729,15 @@ class TestWikipediaPlugin(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertIn("Alan Mathison Turing was an English mathematician.", result.output)
+        self.assertIn(article_url, result.output)
         self.assertNotIn("[6]", result.output)
         self.assertEqual(result.data["url"], article_url)
-        mock_browser.close.assert_awaited_once()
+        mock_browser_ctx.close.assert_awaited_once()
 
     def test_disambiguation_page_follows_first_target(self):
         disambig_url = "https://en.wikipedia.org/w/index.php?search=Mercury&go=Go"
         target_url = "https://en.wikipedia.org/wiki/Mercury_(planet)"
-        mock_factory, mock_browser, _ = self._make_playwright_mock(
+        mock_factory, _mock_browser, mock_browser_ctx, _ = self._make_playwright_mock(
             pages_by_url={
                 disambig_url: {
                     "final_url": "https://en.wikipedia.org/wiki/Mercury",
@@ -1742,13 +1759,14 @@ class TestWikipediaPlugin(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertIn("Mercury is the first planet from the Sun.", result.output)
+        self.assertIn(target_url, result.output)
         self.assertEqual(result.data["url"], target_url)
-        mock_browser.close.assert_awaited_once()
+        mock_browser_ctx.close.assert_awaited_once()
 
     def test_timeout_returns_error_and_closes_browser(self):
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-        mock_factory, mock_browser, _ = self._make_playwright_mock(
+        mock_factory, _mock_browser, mock_browser_ctx, mock_page = self._make_playwright_mock(
             goto_side_effect=PlaywrightTimeoutError("Navigation timeout")
         )
         with patch("playwright.async_api.async_playwright", mock_factory):
@@ -1757,17 +1775,19 @@ class TestWikipediaPlugin(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("timed out", result.output.lower())
         self.assertNotIn("\n", result.output)
-        mock_browser.close.assert_awaited_once()
+        mock_browser_ctx.close.assert_awaited_once()
+        mock_page.screenshot.assert_awaited_once()
 
     def test_missing_summary_returns_error_and_closes_browser(self):
-        mock_factory, mock_browser, _ = self._make_playwright_mock(paragraphs=[])
+        mock_factory, _mock_browser, mock_browser_ctx, mock_page = self._make_playwright_mock(paragraphs=[])
         with patch("playwright.async_api.async_playwright", mock_factory):
             result = _run(self.plugin.execute(query="NonExistentTopicXYZ123"))
 
         self.assertFalse(result.success)
         self.assertIn("No Wikipedia", result.output)
         self.assertNotIn("\n", result.output)
-        mock_browser.close.assert_awaited_once()
+        mock_browser_ctx.close.assert_awaited_once()
+        mock_page.screenshot.assert_awaited_once()
 
 
 def _make_body_playwright_mock(
