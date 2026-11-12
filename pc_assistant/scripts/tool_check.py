@@ -195,7 +195,10 @@ def _print_table(rows: list[tuple[str, str, str, str, bool]], label: str) -> Non
 
 
 async def _run_eval(model_override: str | None) -> int:
-    with tempfile.TemporaryDirectory(prefix="summer_tool_check_") as tmpdir:
+    with tempfile.TemporaryDirectory(
+        prefix="summer_tool_check_",
+        ignore_cleanup_errors=True,
+    ) as tmpdir:
         _setup_hermetic_env(tmpdir, model_override)
 
         import config
