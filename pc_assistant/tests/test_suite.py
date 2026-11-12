@@ -1586,11 +1586,15 @@ class TestWebScraper(unittest.TestCase):
 
 
 class TestWeatherPlugin(unittest.TestCase):
-    """Test WeatherPlugin metadata and wttr.in scraping with mocked Playwright."""
+    """Test WeatherPlugin metadata, location resolution, and wttr.in scraping."""
 
     def setUp(self):
         from plugins.p_weather import WeatherPlugin
         self.plugin = WeatherPlugin()
+
+    def tearDown(self):
+        from plugins.web_scraper import close_browser
+        _run(close_browser())
 
     def test_schema_and_flags(self):
         self.assertEqual(self.plugin.name, "get_weather")
@@ -1598,69 +1602,92 @@ class TestWeatherPlugin(unittest.TestCase):
         self.assertEqual(self.plugin.parameters_schema["required"], [])
         loc_schema = self.plugin.parameters_schema["properties"]["location"]
         self.assertEqual(loc_schema["type"], "string")
-        self.assertIn("Madurai", loc_schema["description"])
-        self.assertNotIn("London", loc_schema["description"])
+        self.assertEqual(
+            loc_schema["description"],
+            "City to get the weather for. Leave empty to use the user's home location.",
+        )
+        for city in ("London", "Paris", "Berlin", "Chennai", "New York", "Tokyo"):
+            self.assertNotIn(city.lower(), loc_schema["description"].lower())
 
-    def test_empty_or_missing_location_defaults_to_madurai(self):
-        for kwargs in ({}, {"location": "   "}):
-            mock_factory, mock_browser, mock_bctx, mock_page = _make_body_playwright_mock(
-                body_text="Weather report: Madurai +31°C Clear",
-                url="https://wttr.in/Madurai?0T",
-            )
-            with patch("playwright.async_api.async_playwright", mock_factory):
-                result = _run(self.plugin.execute(**kwargs))
-
-            self.assertTrue(result.success)
-            self.assertEqual(result.data["location"], "Madurai")
-            self.assertEqual(
-                mock_page.goto.call_args[0][0],
-                "https://wttr.in/Madurai?0T",
-            )
-            mock_bctx.close.assert_awaited_once()
-            mock_browser.close.assert_not_awaited()
-
-    def test_weather_uses_wttr_in_user_agent_cleans_and_truncates_to_1500(self):
-        long_body = "New York\n\n15C   Sunny\n" + ("forecast " * 300)
+    def test_explicit_location_is_url_quoted_and_capped_to_600(self):
+        long_body = "New York:\n\nPartly cloudy,   +15C\n" + ("forecast " * 120)
+        expected_url = (
+            "https://wttr.in/New%20York?"
+            "format=%25l:+%25C,+%25t+(feels+%25f),+humidity+%25h,+wind+%25w"
+        )
         mock_factory, mock_browser, mock_bctx, mock_page = _make_body_playwright_mock(
             body_text=long_body,
-            url="https://wttr.in/New%20York?0T",
+            url=expected_url,
         )
         with patch("playwright.async_api.async_playwright", mock_factory):
             result = _run(self.plugin.execute(location="New York"))
 
         self.assertTrue(result.success)
         self.assertNotIn("\n", result.output)
-        self.assertEqual(len(result.output), 1500)
-        self.assertTrue(result.output.startswith("New York 15C Sunny"))
-        self.assertEqual(
-            mock_page.goto.call_args[0][0],
-            "https://wttr.in/New%20York?0T",
-        )
-        self.assertEqual(mock_page.goto.call_args[1]["wait_until"], "domcontentloaded")
-        ua = mock_browser.new_context.call_args[1]["user_agent"]
-        self.assertIn("Chrome/120.0.0.0", ua)
-        mock_page.locator.assert_called_with("body")
+        self.assertEqual(len(result.output), 600)
+        self.assertTrue(result.output.startswith("New York: Partly cloudy, +15C"))
+        self.assertEqual(mock_page.goto.call_args[0][0], expected_url)
+        self.assertEqual(result.data["location"], "New York")
         mock_bctx.close.assert_awaited_once()
         mock_browser.close.assert_not_awaited()
+
+    def test_empty_location_uses_user_location_config(self):
+        import config
+
+        expected_url = (
+            "https://wttr.in/Paris?"
+            "format=%25l:+%25C,+%25t+(feels+%25f),+humidity+%25h,+wind+%25w"
+        )
+        for kwargs in ({}, {"location": "   "}):
+            mock_factory, mock_browser, mock_bctx, mock_page = _make_body_playwright_mock(
+                body_text="Paris: Clear, +18C (feels +17C), humidity 60%, wind 10km/h",
+                url=expected_url,
+            )
+            with patch.object(config, "USER_LOCATION", "Paris"), \
+                 patch("playwright.async_api.async_playwright", mock_factory):
+                result = _run(self.plugin.execute(**kwargs))
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.data["location"], "Paris")
+            self.assertEqual(mock_page.goto.call_args[0][0], expected_url)
+            mock_bctx.close.assert_awaited_once()
+            mock_browser.close.assert_not_awaited()
+            _run(self._reset_shared_browser())
+
+    async def _reset_shared_browser(self):
+        from plugins.web_scraper import close_browser
+        await close_browser()
+
+    def test_both_empty_asks_for_city_without_launching_browser(self):
+        import config
+
+        mock_factory, _, _, _ = _make_body_playwright_mock()
+        with patch.object(config, "USER_LOCATION", "   "), \
+             patch("playwright.async_api.async_playwright", mock_factory):
+            result = _run(self.plugin.execute(location=""))
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.output, "Which city should I check?")
+        mock_factory.assert_not_called()
 
     def test_weather_empty_body_returns_error(self):
         mock_factory, mock_browser, mock_bctx, _ = _make_body_playwright_mock(body_text="   \n\n  ")
         with patch("playwright.async_api.async_playwright", mock_factory):
-            result = _run(self.plugin.execute(location="Tokyo"))
+            result = _run(self.plugin.execute(location="Berlin"))
 
         self.assertFalse(result.success)
         self.assertIn("empty", result.output.lower())
         mock_bctx.close.assert_awaited_once()
         mock_browser.close.assert_not_awaited()
 
-    def test_weather_timeout_returns_error_and_closes_browser(self):
+    def test_weather_timeout_returns_error(self):
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
         mock_factory, mock_browser, mock_bctx, _ = _make_body_playwright_mock(
             goto_side_effect=PlaywrightTimeoutError("Timed out")
         )
         with patch("playwright.async_api.async_playwright", mock_factory):
-            result = _run(self.plugin.execute(location="Paris"))
+            result = _run(self.plugin.execute(location="Chennai"))
 
         self.assertFalse(result.success)
         self.assertIn("timed out", result.output.lower())
