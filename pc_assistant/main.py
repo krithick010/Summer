@@ -472,6 +472,9 @@ async def lifespan(app: FastAPI):  # noqa: ANN001
 
     # -- Shutdown ----------------------------------------------------------
     log.info("Shutting down…")
+    from plugins.web_scraper import close_browser
+
+    await close_browser()
     if _telegram_app:
         if _telegram_app.updater and _telegram_app.updater.running:
             await _telegram_app.updater.stop()

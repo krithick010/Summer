@@ -1395,6 +1395,7 @@ def _make_body_playwright_mock(
     goto_side_effect=None,
     status=200,
     url="https://example.com",
+    title="Example Page",
 ):
     """Create mocked async_playwright context/browser/page returning ``body_text`` and optional headlines."""
     headlines = headlines or []
@@ -1420,6 +1421,9 @@ def _make_body_playwright_mock(
 
     mock_page = MagicMock()
     mock_page.url = url
+    mock_page.title = AsyncMock(return_value=title)
+    mock_page.route = AsyncMock()
+    mock_page.screenshot = AsyncMock()
     if goto_side_effect is not None:
         mock_page.goto = AsyncMock(side_effect=goto_side_effect)
     else:
@@ -1433,11 +1437,14 @@ def _make_body_playwright_mock(
     mock_browser = MagicMock()
     mock_browser.new_context = AsyncMock(return_value=mock_browser_ctx)
     mock_browser.close = AsyncMock()
+    mock_browser.is_connected = MagicMock(return_value=True)
 
     mock_pw_obj = MagicMock()
     mock_pw_obj.chromium.launch = AsyncMock(return_value=mock_browser)
+    mock_pw_obj.stop = AsyncMock()
 
     mock_ctx = MagicMock()
+    mock_ctx.start = AsyncMock(return_value=mock_pw_obj)
     mock_ctx.__aenter__ = AsyncMock(return_value=mock_pw_obj)
     mock_ctx.__aexit__ = AsyncMock(return_value=False)
 
@@ -1445,7 +1452,11 @@ def _make_body_playwright_mock(
 
 
 class TestWebScraper(unittest.TestCase):
-    """Test shared Playwright web_scraper protections."""
+    """Test shared Playwright web_scraper layer."""
+
+    def tearDown(self):
+        from plugins.web_scraper import close_browser
+        _run(close_browser())
 
     def test_captcha_redirect_returns_blocked_result(self):
         from plugins.web_scraper import scrape_page_body
@@ -1454,7 +1465,7 @@ class TestWebScraper(unittest.TestCase):
             "https://www.google.com/sorry/index?continue=...",
             "https://example.com/captcha-verify",
         ):
-            mock_factory, mock_browser, mock_bctx, _ = _make_body_playwright_mock(
+            mock_factory, mock_browser, mock_bctx, mock_page = _make_body_playwright_mock(
                 body_text="captcha challenge",
                 url=blocked_url,
             )
@@ -1467,7 +1478,111 @@ class TestWebScraper(unittest.TestCase):
             self.assertEqual(result.output, "⚠️ Blocked by CAPTCHA.")
             self.assertEqual(result.error, "CAPTCHA redirect detected")
             mock_bctx.close.assert_awaited_once()
-            mock_browser.close.assert_awaited_once()
+            mock_page.screenshot.assert_awaited_once()
+            mock_browser.close.assert_not_awaited()
+            _run(self._reset_shared_browser())
+
+    async def _reset_shared_browser(self):
+        from plugins.web_scraper import close_browser
+        await close_browser()
+
+    def test_shared_browser_started_once_and_contexts_closed(self):
+        from plugins.web_scraper import scrape_page_body
+
+        mock_factory, mock_browser, mock_bctx, _ = _make_body_playwright_mock(
+            body_text="hello world",
+            url="https://example.com/1",
+        )
+        pw_instance = mock_factory.return_value.start.return_value
+
+        async def _two_calls():
+            r1 = await scrape_page_body("https://example.com/1", max_chars=100, label="One")
+            r2 = await scrape_page_body("https://example.com/2", max_chars=100, label="Two")
+            return r1, r2
+
+        with patch("playwright.async_api.async_playwright", mock_factory):
+            r1, r2 = _run(_two_calls())
+
+        self.assertTrue(r1.success)
+        self.assertTrue(r2.success)
+        self.assertEqual(pw_instance.chromium.launch.await_count, 1)
+        self.assertEqual(mock_browser.new_context.await_count, 2)
+        self.assertEqual(mock_bctx.close.await_count, 2)
+
+    def test_failure_saves_debug_screenshot_and_prunes_to_10(self):
+        import config
+        from plugins.web_scraper import scrape_page_body
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            debug_dir = Path(tmpdir) / "debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            # Seed 11 older screenshots
+            for i in range(11):
+                p = debug_dir / f"old-{i:02d}.png"
+                p.write_bytes(b"png")
+                os.utime(p, (1000 + i, 1000 + i))
+
+            mock_factory, _, mock_bctx, mock_page = _make_body_playwright_mock(
+                status=500,
+                url="https://example.com/err",
+            )
+
+            async def _fake_screenshot(path):
+                Path(path).write_bytes(b"new-png")
+
+            mock_page.screenshot = AsyncMock(side_effect=_fake_screenshot)
+
+            with patch.object(config, "DATA_DIR", Path(tmpdir)), \
+                 patch("playwright.async_api.async_playwright", mock_factory):
+                result = _run(
+                    scrape_page_body("https://example.com/err", max_chars=100, label="FailTest")
+                )
+
+            self.assertFalse(result.success)
+            self.assertNotIn("debug", result.output.lower())
+            mock_bctx.close.assert_awaited_once()
+            mock_page.screenshot.assert_awaited_once()
+            remaining = list(debug_dir.glob("*.png"))
+            self.assertEqual(len(remaining), 10)
+            self.assertFalse((debug_dir / "old-00.png").exists())
+            self.assertFalse((debug_dir / "old-01.png").exists())
+
+    def test_browser_headless_false_passed_to_launch(self):
+        import config
+        from plugins.web_scraper import scrape_page_body
+
+        mock_factory, _, _, _ = _make_body_playwright_mock(body_text="ok")
+        pw_instance = mock_factory.return_value.start.return_value
+
+        with patch.object(config, "BROWSER_HEADLESS", False), \
+             patch("playwright.async_api.async_playwright", mock_factory):
+            result = _run(
+                scrape_page_body("https://example.com", max_chars=100, label="Headful")
+            )
+
+        self.assertTrue(result.success)
+        pw_instance.chromium.launch.assert_awaited_once_with(headless=False)
+
+    def test_blocked_resource_types_are_aborted(self):
+        from plugins.web_scraper import _abort_heavy_resources
+
+        for blocked in ("image", "media", "font"):
+            route = MagicMock()
+            route.request.resource_type = blocked
+            route.abort = AsyncMock()
+            route.continue_ = AsyncMock()
+            _run(_abort_heavy_resources(route))
+            route.abort.assert_awaited_once()
+            route.continue_.assert_not_awaited()
+
+        for allowed in ("document", "script", "xhr"):
+            route = MagicMock()
+            route.request.resource_type = allowed
+            route.abort = AsyncMock()
+            route.continue_ = AsyncMock()
+            _run(_abort_heavy_resources(route))
+            route.continue_.assert_awaited_once()
+            route.abort.assert_not_awaited()
 
 
 class TestWeatherPlugin(unittest.TestCase):
@@ -1502,7 +1617,7 @@ class TestWeatherPlugin(unittest.TestCase):
                 "https://wttr.in/Madurai?0T",
             )
             mock_bctx.close.assert_awaited_once()
-            mock_browser.close.assert_awaited_once()
+            mock_browser.close.assert_not_awaited()
 
     def test_weather_uses_wttr_in_user_agent_cleans_and_truncates_to_1500(self):
         long_body = "New York\n\n15C   Sunny\n" + ("forecast " * 300)
@@ -1526,7 +1641,7 @@ class TestWeatherPlugin(unittest.TestCase):
         self.assertIn("Chrome/120.0.0.0", ua)
         mock_page.locator.assert_called_with("body")
         mock_bctx.close.assert_awaited_once()
-        mock_browser.close.assert_awaited_once()
+        mock_browser.close.assert_not_awaited()
 
     def test_weather_empty_body_returns_error(self):
         mock_factory, mock_browser, mock_bctx, _ = _make_body_playwright_mock(body_text="   \n\n  ")
@@ -1536,7 +1651,7 @@ class TestWeatherPlugin(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("empty", result.output.lower())
         mock_bctx.close.assert_awaited_once()
-        mock_browser.close.assert_awaited_once()
+        mock_browser.close.assert_not_awaited()
 
     def test_weather_timeout_returns_error_and_closes_browser(self):
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -1550,7 +1665,7 @@ class TestWeatherPlugin(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("timed out", result.output.lower())
         mock_bctx.close.assert_awaited_once()
-        mock_browser.close.assert_awaited_once()
+        mock_browser.close.assert_not_awaited()
 
 
 class TestAINewsPlugin(unittest.TestCase):
@@ -1596,7 +1711,7 @@ class TestAINewsPlugin(unittest.TestCase):
         self.assertIn("Chrome/120.0.0.0", ua)
         mock_page.locator.assert_called_with("h2, h3")
         mock_bctx.close.assert_awaited_once()
-        mock_browser.close.assert_awaited_once()
+        mock_browser.close.assert_not_awaited()
 
     def test_falls_back_to_body_truncated_to_2500(self):
         long_news = "AI Daily\n\nTop Story\n" + ("article " * 500)
@@ -1613,7 +1728,7 @@ class TestAINewsPlugin(unittest.TestCase):
         self.assertEqual(len(result.output), 2500)
         self.assertTrue(result.output.startswith("AI Daily Top Story"))
         mock_bctx.close.assert_awaited_once()
-        mock_browser.close.assert_awaited_once()
+        mock_browser.close.assert_not_awaited()
 
     def test_no_results_returns_error_and_closes_browser(self):
         mock_factory, mock_browser, mock_bctx, _ = _make_body_playwright_mock(body_text="\n  \n")
@@ -1622,7 +1737,7 @@ class TestAINewsPlugin(unittest.TestCase):
 
         self.assertFalse(result.success)
         mock_bctx.close.assert_awaited_once()
-        mock_browser.close.assert_awaited_once()
+        mock_browser.close.assert_not_awaited()
 
     def test_timeout_returns_error_and_closes_browser(self):
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -1636,7 +1751,7 @@ class TestAINewsPlugin(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("timed out", result.output.lower())
         mock_bctx.close.assert_awaited_once()
-        mock_browser.close.assert_awaited_once()
+        mock_browser.close.assert_not_awaited()
 
 
 class TestTelegramHITLCallback(unittest.TestCase):
