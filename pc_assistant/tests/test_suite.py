@@ -2641,6 +2641,26 @@ class TestFastAPIApp(unittest.TestCase):
                 resp = client.post("/webhook/wrong-token", json={})
                 self.assertEqual(resp.status_code, 403)
 
+    def test_telegram_link_previews_disabled(self):
+        from telegram import LinkPreviewOptions
+        import main
+
+        mock_bot = MagicMock()
+        mock_bot.send_message = AsyncMock(side_effect=[ValueError("bad markdown"), "ok"])
+        _run(main._safe_send_message(mock_bot, chat_id=123, text="See https://example.com"))
+        self.assertEqual(mock_bot.send_message.await_count, 2)
+        for call in mock_bot.send_message.await_args_list:
+            opts = call.kwargs["link_preview_options"]
+            self.assertIsInstance(opts, LinkPreviewOptions)
+            self.assertTrue(opts.is_disabled)
+
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock(return_value="ok")
+        _run(main._safe_reply_text(mock_msg, text="See https://example.com"))
+        opts = mock_msg.reply_text.await_args.kwargs["link_preview_options"]
+        self.assertIsInstance(opts, LinkPreviewOptions)
+        self.assertTrue(opts.is_disabled)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

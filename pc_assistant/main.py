@@ -33,6 +33,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LinkPreviewOptions,
     Update,
 )
 from telegram.constants import ChatAction, ParseMode
@@ -86,6 +87,9 @@ def _deny_message() -> str:
     )
 
 
+_NO_LINK_PREVIEW = LinkPreviewOptions(is_disabled=True)
+
+
 async def _safe_send_message(
     bot: Any,
     chat_id: int,
@@ -99,12 +103,14 @@ async def _safe_send_message(
             text=text,
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=reply_markup,
+            link_preview_options=_NO_LINK_PREVIEW,
         )
     except Exception:
         return await bot.send_message(
             chat_id=chat_id,
             text=text,
             reply_markup=reply_markup,
+            link_preview_options=_NO_LINK_PREVIEW,
         )
 
 
@@ -119,11 +125,13 @@ async def _safe_reply_text(
             text=text,
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=reply_markup,
+            link_preview_options=_NO_LINK_PREVIEW,
         )
     except Exception:
         return await message.reply_text(
             text=text,
             reply_markup=reply_markup,
+            link_preview_options=_NO_LINK_PREVIEW,
         )
 
 
