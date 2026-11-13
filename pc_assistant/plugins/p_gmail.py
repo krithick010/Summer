@@ -408,11 +408,12 @@ class GmailPlugin(PluginBase):
             )
 
         encoded = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-        service.users().messages().send(
+        resp = service.users().messages().send(
             userId="me", body={"raw": encoded}
         ).execute()
+        msg_id = resp.get("id") if isinstance(resp, dict) else None
 
-        log.info("Email sent to %s | subject: %r (attachment: %s)", to_email, subject, attachment_path)
+        log.info("Email sent to %s (id: %s) | subject: %r (attachment: %s)", to_email, msg_id, subject, attachment_path)
         att_line = f"\n📎 *Attachment:* `{Path(attachment_path).name}`" if attachment_path else ""
         direct_reply = f"📧 Email sent to {to_email} (Subject: '{subject}')."
         data: dict[str, Any] = {
