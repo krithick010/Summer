@@ -293,7 +293,8 @@ async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Assistant not ready.")
         return
 
-    _orchestrator.intent_router.update_context(user_id, last_query=query_str)
+    if hasattr(_orchestrator, "intent_router") and _orchestrator.intent_router:
+        _orchestrator.intent_router.update_context(user_id, last_query=query_str)
     res = await _orchestrator.run_tool(
         tool_name="find_files",
         kwargs={"query": query_str, "user_id": user_id},
