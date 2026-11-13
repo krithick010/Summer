@@ -99,6 +99,29 @@ def _build_multi_turn_scenarios() -> list[tuple[str, list[EvalCase]]]:
     ]
 
 
+def _build_file_eval_cases() -> list[EvalCase]:
+    return [
+        EvalCase("send me my aicte final file", "find_files"),
+        EvalCase("where is the hangover movie", "find_files"),
+        EvalCase("find my resume pdf", "find_files"),
+        EvalCase("send C:/Users/test/report.pdf", "share_file"),
+        EvalCase(
+            "mail me report.pdf",
+            "share_file",
+            lambda calls: any(
+                name == "share_file"
+                and (
+                    "email" in str(args.get("delivery", "")).lower()
+                    or "mail" in str(args.get("delivery", "")).lower()
+                )
+                for name, args in calls
+            ),
+            note="delivery=email",
+        ),
+        EvalCase("hi", None),
+    ]
+
+
 def _setup_hermetic_env(tmpdir: str, model_override: str | None) -> None:
     """Configure temp storage env vars before importing ``config``."""
     pc_assistant_dir = str(Path(__file__).resolve().parent.parent)
@@ -128,6 +151,15 @@ def _stub_orchestrator_plugins(orch: Any, recorded_calls: list[tuple[str, dict[s
         except Exception:
             pass
 
+    if "find_files" not in orch.registry or "share_file" not in orch.registry:
+        try:
+            from plugins.p_files import FindFilesPlugin, ShareFilePlugin
+
+            orch.registry["find_files"] = FindFilesPlugin()
+            orch.registry["share_file"] = ShareFilePlugin()
+        except Exception:
+            pass
+
     for tool_name, plugin in orch.registry.items():
         async def _stub_execute(
             _tool: str = tool_name, **kwargs: Any
@@ -147,6 +179,19 @@ def _stub_orchestrator_plugins(orch: Any, recorded_calls: list[tuple[str, dict[s
                 out = f"Stub summary for {kwargs.get('query', 'topic')}."
             elif _tool == "system_info":
                 out = "CPU: 12% | RAM: 45% | Disk: 50%"
+            elif _tool == "find_files":
+                out = "1. Report.pdf - 1.2 MB - 2026-09-14 - in Downloads\nTap one to send it."
+                return PluginResult(
+                    success=True,
+                    output=out,
+                    data={
+                        "direct_reply": out,
+                        "choices": [{"label": "1. Report.pdf (1.2 MB)", "tool": "share_file", "kwargs": {"path": "C:/fake/Report.pdf"}}],
+                    },
+                )
+            elif _tool == "share_file":
+                out = f"Sent: {Path(kwargs.get('path', 'file')).name} via {kwargs.get('delivery', 'Telegram')}."
+                return PluginResult(success=True, output=out, data={"direct_reply": out})
             else:
                 out = f"Stub {_tool} result."
             return PluginResult(success=True, output=out)
@@ -259,6 +304,45 @@ async def _run_eval(model_override: str | None) -> int:
 
         _print_table(mt_rows, f"Multi-Turn Eval (model={config.OLLAMA_MODEL})")
         print(f"\n{mt_correct}/{mt_total} correct")
+
+        # File Sharing & Search Eval Cases
+        file_cases = _build_file_eval_cases()
+        file_rows: list[tuple[str, str, str, str, bool]] = []
+        file_correct = 0
+        for case in file_cases:
+            orch.history.clear(uid)
+            recorded_calls.clear()
+            t0 = time.perf_counter()
+            await orch.handle_user_message(uid, uid, case.message)
+            elapsed = time.perf_counter() - t0
+            passed = _matches_case(case, recorded_calls)
+            if passed:
+                file_correct += 1
+            exp_label = case.expected_tool or "none"
+            if case.note:
+                exp_label = f"{exp_label} ({case.note})"
+            actual_label = ", ".join(f"{n}({a})" if a else n for n, a in recorded_calls) or "none"
+            file_rows.append((case.message, exp_label, actual_label, f"{elapsed:.2f}", passed))
+
+        _print_table(file_rows, f"File Tools Eval (model={config.OLLAMA_MODEL})")
+        print(f"\n{file_correct}/{len(file_cases)} correct")
+
+        # Probe "Hmm, say that again?" / Empty reply bug
+        probe_msgs = [
+            r"Aicte final, docs file in krith\downloads",
+            "Bro find me that file",
+        ]
+        print(f"\n=== Probing 'Hmm, say that again?' bug (3x runs) ===")
+        for pmsg in probe_msgs:
+            print(f"\nQuery: {pmsg!r}")
+            for run_i in range(1, 4):
+                orch.history.clear(uid)
+                t0 = time.perf_counter()
+                reply = await orch.handle_user_message(uid, uid, pmsg)
+                elapsed = time.perf_counter() - t0
+                raw_text = reply.text if hasattr(reply, "text") else str(reply)
+                print(f"  Run #{run_i} ({elapsed:.2f}s): {raw_text!r}")
+
         orch.history.close()
         return 0
 

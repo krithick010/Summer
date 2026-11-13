@@ -23,6 +23,7 @@ Security
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -97,27 +98,28 @@ async def _safe_send_message(
     chat_id: int,
     text: str,
     reply_markup: Any = None,
+    parse_mode: Any = None,
 ) -> Any:
-    """Send a message using Markdown, falling back to plain text if Telegram fails parsing entities."""
+    """Send a message, defaulting to plain text (no parse_mode) to protect underscores."""
+    send_kwargs: dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": reply_markup,
+        "link_preview_options": _NO_LINK_PREVIEW,
+    }
+    if parse_mode is not None:
+        send_kwargs["parse_mode"] = parse_mode
+
     try:
-        coro = bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=reply_markup,
-            link_preview_options=_NO_LINK_PREVIEW,
-        )
+        coro = bot.send_message(**send_kwargs)
         if asyncio.iscoroutine(coro):
             return await coro
         return coro
     except Exception:
+        # Fall back to plain text if formatting failed
+        send_kwargs.pop("parse_mode", None)
         try:
-            coro = bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                reply_markup=reply_markup,
-                link_preview_options=_NO_LINK_PREVIEW,
-            )
+            coro = bot.send_message(**send_kwargs)
             if asyncio.iscoroutine(coro):
                 return await coro
             return coro
@@ -129,21 +131,31 @@ async def _safe_reply_text(
     message: Any,
     text: str,
     reply_markup: Any = None,
+    parse_mode: Any = None,
 ) -> Any:
-    """Reply using Markdown, falling back to plain text if Telegram fails parsing entities."""
+    """Reply using specified parse_mode (or plain text by default)."""
+    reply_kwargs: dict[str, Any] = {
+        "text": text,
+        "reply_markup": reply_markup,
+        "link_preview_options": _NO_LINK_PREVIEW,
+    }
+    if parse_mode is not None:
+        reply_kwargs["parse_mode"] = parse_mode
+
     try:
-        return await message.reply_text(
-            text=text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=reply_markup,
-            link_preview_options=_NO_LINK_PREVIEW,
-        )
+        coro = message.reply_text(**reply_kwargs)
+        if asyncio.iscoroutine(coro):
+            return await coro
+        return coro
     except Exception:
-        return await message.reply_text(
-            text=text,
-            reply_markup=reply_markup,
-            link_preview_options=_NO_LINK_PREVIEW,
-        )
+        reply_kwargs.pop("parse_mode", None)
+        try:
+            coro = message.reply_text(**reply_kwargs)
+            if asyncio.iscoroutine(coro):
+                return await coro
+            return coro
+        except Exception:
+            return None
 
 
 # ===========================================================================
@@ -342,7 +354,7 @@ async def handle_callback_query(
             await query.edit_message_text(
                 approval_payload["text"],
                 reply_markup=approval_payload["reply_markup"],
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode=approval_payload.get("parse_mode", ParseMode.HTML),
             )
         else:
             txt = (
@@ -537,7 +549,9 @@ def build_hitl_prompt(
     preview_text: str,
     tool_name: str,
 ) -> dict[str, Any]:
-    """Return a dict with ``text`` and ``reply_markup`` for a HITL prompt."""
+    """Return a dict with ``text``, ``reply_markup``, and ``parse_mode=HTML`` for a HITL prompt."""
+    escaped_tool = html.escape(tool_name)
+    escaped_preview = html.escape(preview_text)
     keyboard = InlineKeyboardMarkup(
         [
             [
@@ -552,12 +566,13 @@ def build_hitl_prompt(
     )
     return {
         "text": (
-            f"🔐 *Action requires your approval*\n\n"
-            f"*Tool:* `{tool_name}`\n\n"
-            f"{preview_text}\n\n"
-            "_Tap Approve or Cancel below._"
+            f"🔐 <b>Action requires your approval</b>\n\n"
+            f"<b>Tool:</b> <code>{escaped_tool}</code>\n\n"
+            f"{escaped_preview}\n\n"
+            "<i>Tap Approve or Cancel below.</i>"
         ),
         "reply_markup": keyboard,
+        "parse_mode": ParseMode.HTML,
     }
 
 

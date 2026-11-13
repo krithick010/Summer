@@ -73,6 +73,7 @@ def _format_tools_section(plugins_arg: Iterable[PluginBase] | Mapping[str, Plugi
         "TOOLS (use them, never guess):",
         *plugin_lines,
         "- Never answer weather, news, lookups or PC stats from your own knowledge. If you did not call the tool, you do not have the answer.",
+        "- Never say you found, opened, sent or emailed anything unless a tool result says so. You cannot open files on this PC.",
         "- Call the tool again every time, even if you answered something similar earlier.",
         "- After a tool returns, report its result faithfully. If it failed, say so in one short line. Don't suggest other places or topics.",
         "- For greetings, small talk and anything about facts he told you, don't call tools.",
@@ -282,7 +283,9 @@ class Orchestrator:
                     "content": build_system_prompt(memories, plugins=self.registry.values()),
                 }
             ]
-            msgs += hist + [{"role": "user", "content": message}]
+            # Normalise backslashes in user message sent to the LLM to prevent JSON escape sequence issues
+            model_content = message.replace("\\", "/")
+            msgs += hist + [{"role": "user", "content": model_content}]
 
             tools = self._chat_tools()
 
@@ -355,7 +358,14 @@ class Orchestrator:
                 reply = await self.llm.chat(msgs, tools=tools)
                 log.info("tool_calls=%s", reply.get("tool_calls"))
 
-            text = (reply.get("content") or "").strip() or "Hmm, say that again?"
+            content = (reply.get("content") or "").strip()
+            calls = reply.get("tool_calls")
+            if not content and not calls and not tool_trace:
+                done_reason = reply.get("done_reason") or reply.get("finish_reason") or "unknown"
+                log.warning("Empty model reply: done_reason=%s raw=%r", done_reason, reply)
+                text = "I didn't catch that. Can you rephrase?"
+            else:
+                text = content or "I didn't catch that. Can you rephrase?"
             self.history.add(user_id, "user", message)
             for entry in tool_trace:
                 self.history.add(user_id, entry)

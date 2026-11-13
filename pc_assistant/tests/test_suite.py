@@ -3543,5 +3543,68 @@ class TestPhase3ReliableDelivery(unittest.TestCase):
                 self.assertTrue(new_file.exists())
 
 
+class TestPhase4HonestyAndFormatting(unittest.TestCase):
+    """Hermetic unit tests for Phase 4 tool honesty and plain text / HTML formatting."""
+
+    def test_system_prompt_includes_honesty_rule_and_tool_hints(self):
+        from core.orchestrator import build_system_prompt
+        from plugins.p_files import FindFilesPlugin, ShareFilePlugin
+        prompt = build_system_prompt(plugins=[FindFilesPlugin(), ShareFilePlugin()])
+        self.assertIn(
+            "Never say you found, opened, sent or emailed anything unless a tool result says so. You cannot open files on this PC.",
+            prompt,
+        )
+        self.assertIn(
+            "find_files: use for when they ask to find, locate or send a file or folder (always search first)",
+            prompt,
+        )
+        self.assertIn(
+            "share_file: use for only with an exact path from find_files or typed by the user",
+            prompt,
+        )
+
+    def test_empty_model_reply_logs_warning_and_returns_friendly_rephrase(self):
+        from core.orchestrator import Orchestrator
+        orch = Orchestrator(llm=MagicMock())
+        orch.llm.chat = AsyncMock(return_value={
+            "role": "assistant",
+            "content": "",
+            "tool_calls": None,
+            "done_reason": "stop",
+        })
+        with self.assertLogs("core.orchestrator", level="WARNING") as cm:
+            reply = _run(orch.handle_user_message(user_id=1, chat_id=1, message="hello"))
+            self.assertEqual(reply, "I didn't catch that. Can you rephrase?")
+            self.assertTrue(any("Empty model reply" in log_msg for log_msg in cm.output))
+            self.assertTrue(any("done_reason=stop" in log_msg for log_msg in cm.output))
+
+    def test_backslash_normalized_in_text_sent_to_model(self):
+        from core.orchestrator import Orchestrator
+        orch = Orchestrator(llm=MagicMock())
+        orch.llm.chat = AsyncMock(return_value={"role": "assistant", "content": "Found it!"})
+        _run(orch.handle_user_message(user_id=1, chat_id=1, message=r"Aicte final, docs file in krith\downloads"))
+        sent_msgs = orch.llm.chat.call_args[0][0]
+        user_msg = next(m["content"] for m in sent_msgs if m.get("role") == "user")
+        self.assertNotIn(r"krith\downloads", user_msg)
+        self.assertIn("krith/downloads", user_msg)
+
+    def test_approval_card_html_escaped_preserves_underscores(self):
+        import main
+        from telegram.constants import ParseMode
+        filename = "Ashish_Resume_final.pdf"
+        preview = f"• File: {filename}\n• Size: 1.5 MB\n• Route: Telegram"
+        prompt_dict = main.build_hitl_prompt(
+            approval_id="test1234",
+            preview_text=preview,
+            tool_name="share_file",
+        )
+        self.assertEqual(prompt_dict["parse_mode"], ParseMode.HTML)
+        # Underscores in filename are preserved intact without Markdown italics delimiters
+        self.assertIn("Ashish_Resume_final.pdf", prompt_dict["text"])
+        self.assertNotIn("<em>", prompt_dict["text"])
+        self.assertNotIn("<i>Ashish", prompt_dict["text"])
+        self.assertIn("<b>Tool:</b> <code>share_file</code>", prompt_dict["text"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
