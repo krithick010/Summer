@@ -18,10 +18,14 @@ import config
 from plugins.base import PluginBase, PluginResult
 from plugins.file_search import (
     ALREADY_COMPRESSED_EXTENSIONS,
+    check_and_increment_share_limit,
     compress_to_zip,
     find_files,
     get_search_roots,
+    is_outside_usual_folders,
     is_sensitive_path,
+    is_soft_sensitive,
+    log_file_audit,
     search_files,
     split_file_chunks,
 )
@@ -167,18 +171,26 @@ class ShareFilePlugin(PluginBase):
         except Exception:
             size_mb = 0.0
 
-        return (
-            f"• File: {target.name}\n"
-            f"• Path: {target.resolve()}\n"
-            f"• Size: {size_mb:.1f} MB\n"
-            f"• Route: {route_str}\n"
-            f"• Action: Send via {route_str}"
-        )
+        preview_lines = [
+            f"• File: {target.name}",
+            f"• Path: {target.resolve()}",
+            f"• Size: {size_mb:.1f} MB",
+            f"• Route: {route_str}",
+            f"• Action: Send via {route_str}",
+        ]
+
+        if is_outside_usual_folders(target):
+            preview_lines.append("⚠️ Note: file is outside your usual folders")
+        if is_soft_sensitive(target):
+            preview_lines.append("⚠️ Note: filename looks sensitive")
+
+        return "\n".join(preview_lines)
 
     async def execute(self, **kwargs: Any) -> PluginResult:
         path_str = str(kwargs.get("path") or kwargs.get("query") or "").strip()
         delivery = str(kwargs.get("delivery", "telegram")).lower()
         to_email = str(kwargs.get("to_email", "")).strip()
+        user_id = kwargs.get("user_id")
 
         if not path_str:
             return PluginResult(
@@ -211,6 +223,23 @@ class ShareFilePlugin(PluginBase):
                 success=False,
                 output=f"⚠️ Access denied: '{target.name}' is a protected or sensitive file.",
                 error="Sensitive file access blocked",
+            )
+
+        # Rate limit check
+        allowed, rl_msg = check_and_increment_share_limit(user_id)
+        if not allowed:
+            log_file_audit(
+                user_id=user_id or 0,
+                action="share",
+                path=target,
+                size=0,
+                route=delivery,
+                status="rate_limited",
+            )
+            return PluginResult(
+                success=False,
+                output=f"⚠️ {rl_msg}",
+                error=rl_msg,
             )
 
         tmp_shares_dir = Path(config.DATA_DIR) / "tmp_shares"
@@ -299,6 +328,14 @@ class ShareFilePlugin(PluginBase):
                 direct_reply = f"Sent: {target.name} ({size_mb:.1f} MB) via Email."
                 res.data = {"direct_reply": direct_reply}
                 res.output = direct_reply
+                log_file_audit(
+                    user_id=user_id or 0,
+                    action="share",
+                    path=target.resolve() if target.exists() else target,
+                    size=f"{size_mb:.1f} MB",
+                    route="Email",
+                    status="approved",
+                )
                 return res
             finally:
                 if is_temp_zip:
@@ -313,6 +350,14 @@ class ShareFilePlugin(PluginBase):
             )
             kind = "photo" if is_photo else "document"
             direct_reply = f"Sent: {send_path.name} ({size_mb:.1f} MB) via Telegram."
+            log_file_audit(
+                user_id=user_id or 0,
+                action="share",
+                path=target.resolve() if target.exists() else target,
+                size=f"{size_mb:.1f} MB",
+                route="Telegram",
+                status="approved",
+            )
             return PluginResult(
                 success=True,
                 output=direct_reply,
@@ -348,6 +393,14 @@ class ShareFilePlugin(PluginBase):
         # If compression brought it under 50 MB:
         if size_mb <= config.FILE_TELEGRAM_MAX_MB:
             direct_reply = f"Sent: {send_path.name} ({size_mb:.1f} MB) via Telegram."
+            log_file_audit(
+                user_id=user_id or 0,
+                action="share",
+                path=target.resolve() if target.exists() else target,
+                size=f"{size_mb:.1f} MB",
+                route="Telegram",
+                status="approved",
+            )
             return PluginResult(
                 success=True,
                 output=direct_reply,
@@ -368,6 +421,14 @@ class ShareFilePlugin(PluginBase):
         if size_mb > config.FILE_MAX_SPLIT_MB:
             if is_temp_zip:
                 send_path.unlink(missing_ok=True)
+            log_file_audit(
+                user_id=user_id or 0,
+                action="share",
+                path=target.resolve() if target.exists() else target,
+                size=f"{size_mb:.1f} MB",
+                route=delivery,
+                status="error",
+            )
             return PluginResult(
                 success=False,
                 output=(
@@ -412,6 +473,14 @@ class ShareFilePlugin(PluginBase):
         direct_reply = (
             f"Sent: {target.name} ({size_mb:.1f} MB) in {len(parts)} parts via Telegram.\n"
             f"{join_hint}"
+        )
+        log_file_audit(
+            user_id=user_id or 0,
+            action="share",
+            path=target.resolve() if target.exists() else target,
+            size=f"{size_mb:.1f} MB",
+            route="Telegram",
+            status="approved",
         )
         return PluginResult(
             success=True,

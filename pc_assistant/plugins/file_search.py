@@ -32,16 +32,46 @@ ALREADY_COMPRESSED_EXTENSIONS: set[str] = {
     ".pdf", ".mp3",
 }
 
-# Security denylist: sensitive files, keys, credentials, and state databases
-SENSITIVE_NAMES = {
+SENSITIVE_EXTS: set[str] = {
+    ".key", ".pem", ".pfx", ".p12", ".ovpn", ".kdbx", ".keystore",
+}
+
+SENSITIVE_FILES_EXACT: set[str] = {
+    "login data",
+    "cookies",
+    "web data",
+    "local state",
+    "key4.db",
+    "logins.json",
+    "ntuser.dat",
+    "sam",
+    "system",
+    "security",
+    "wallet.dat",
+    ".git-credentials",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "file_index.db",
     "gmail_token.json",
     "gmail_oauth.json",
     "whatsapp_session",
-    "memory_db",
     "history.db",
-    ".env",
+    "shadow",
+    "sudoers",
 }
-SENSITIVE_EXTS = {".key", ".pem"}
+
+SENSITIVE_DIR_SEGMENTS: set[str] = {
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".azure",
+    ".kube",
+    ".docker",
+    "bravesoftware",
+    "credentials",
+    "memory_db",
+}
 
 # Directory names pruned in-place
 ALWAYS_EXCLUDED_NAMES: set[str] = {
@@ -144,38 +174,167 @@ class FileMatch:
 def is_sensitive_path(path: Path | str) -> bool:
     """Return True if ``path`` matches sensitive patterns, credentials, or keys."""
     try:
+        p = Path(path)
+    except Exception:
+        return True
+
+    name_lower = p.name.lower()
+    suffix_lower = p.suffix.lower()
+    p_str = str(p).replace("\\", "/").lower()
+    parts_lower = [part.lower() for part in p.parts]
+
+    # 1. Private keys & certificates by extension
+    if suffix_lower in SENSITIVE_EXTS:
+        return True
+
+    # 2. Key prefixes and crypto wallets
+    if (
+        name_lower.startswith("id_rsa")
+        or name_lower.startswith("id_ed25519")
+        or "keystore" in name_lower
+        or name_lower == "wallet.dat"
+    ):
+        return True
+
+    # 3. Exact sensitive file names
+    if name_lower in SENSITIVE_FILES_EXACT:
+        return True
+
+    # 4. Summer's own secrets: .env, .env.*, *.env
+    if name_lower == ".env" or name_lower.startswith(".env.") or name_lower.endswith(".env") or suffix_lower == ".env":
+        return True
+
+    # 5. Gmail token patterns
+    if "gmail_token" in name_lower or "gmail_oauth" in name_lower:
+        return True
+
+    # 6. Sensitive directory segments
+    for part in parts_lower:
+        if part in SENSITIVE_DIR_SEGMENTS:
+            return True
+        if part in SENSITIVE_FILES_EXACT:
+            return True
+        if part == ".env" or part.startswith(".env."):
+            return True
+        if part.startswith("id_rsa") or part.startswith("id_ed25519"):
+            return True
+        if any(part.endswith(ext) for ext in SENSITIVE_EXTS):
+            return True
+
+    # 7. Specific credential dirs: .config/gcloud
+    if "gcloud" in parts_lower:
+        return True
+
+    # 8. Browser folders: Chrome/User Data, Edge/User Data, Firefox/Profiles, BraveSoftware
+    if "user data" in parts_lower:
+        if any(b in p_str for b in ("chrome", "edge", "google", "microsoft")):
+            return True
+    if "profiles" in parts_lower:
+        if any(b in p_str for b in ("firefox", "mozilla")):
+            return True
+    if "bravesoftware" in p_str or "brave-browser" in p_str:
+        return True
+
+    # 9. OS credentials: /etc/shadow, /etc/sudoers
+    if "/etc/shadow" in p_str or "/etc/sudoers" in p_str or p_str.endswith("/shadow") or p_str.endswith("/sudoers"):
+        return True
+
+    # 10. Summer's data directory & memory DB
+    try:
+        data_dir_cfg = getattr(config, "DATA_DIR", "data")
+        if data_dir_cfg:
+            data_dir = Path(data_dir_cfg).resolve()
+            p_res = p.resolve()
+            if p_res == data_dir or data_dir in p_res.parents:
+                if name_lower in ("history.db", "memory_db", "file_index.db", "file_audit.log") or "memory_db" in parts_lower:
+                    return True
+    except Exception:
+        pass
+
+    return False
+
+
+SOFT_SENSITIVE_WORDS = ("password", "passwd", "secret", "token", "private")
+USUAL_FOLDER_NAMES = {"desktop", "documents", "downloads", "pictures", "videos", "music"}
+
+
+def is_soft_sensitive(path: Path | str) -> bool:
+    """Return True if filename contains soft-sensitive indicator words."""
+    p = Path(path)
+    name_l = p.name.lower()
+    return any(w in name_l for w in SOFT_SENSITIVE_WORDS)
+
+
+def is_outside_usual_folders(path: Path | str) -> bool:
+    """Return True if path is not within usual user folders (Desktop, Documents, Downloads, Pictures, Videos, Music)."""
+    try:
         p = Path(path).resolve()
     except Exception:
         p = Path(path)
 
-    parts_lower = [part.lower() for part in p.parts]
-    name_lower = p.name.lower()
+    for parent in [p] + list(p.parents):
+        if parent.name.lower() in USUAL_FOLDER_NAMES:
+            return False
+    return True
 
-    if p.suffix.lower() in SENSITIVE_EXTS:
-        return True
 
-    for part in parts_lower:
-        if part in SENSITIVE_NAMES:
-            return True
-        if "credentials" in part:
-            return True
-        if part == "id_rsa" or part.startswith("id_rsa"):
-            return True
-        if part == ".env" or part.startswith(".env") or part.endswith(".env"):
-            return True
-        if any(part.endswith(ext) for ext in SENSITIVE_EXTS):
-            return True
-        if "memory_db" in part or "history.db" in part:
-            return True
+_SHARE_RATE_LIMITS: dict[int, list[float]] = {}
 
-    if name_lower in SENSITIVE_NAMES:
-        return True
-    if name_lower.startswith("id_rsa") or name_lower.startswith(".env") or name_lower.endswith(".env"):
-        return True
-    if "credentials" in name_lower:
-        return True
 
-    return False
+def check_and_increment_share_limit(user_id: int | None = None) -> tuple[bool, str]:
+    """Check rolling 3600-second window for user_id against config.FILE_MAX_SHARES_PER_HOUR.
+
+    Returns (allowed: bool, message: str).
+    """
+    if not user_id:
+        uid = 0
+    else:
+        try:
+            uid = int(user_id)
+        except (ValueError, TypeError):
+            uid = 0
+
+    max_shares = getattr(config, "FILE_MAX_SHARES_PER_HOUR", 20)
+    now = time.time()
+    cutoff = now - 3600.0
+
+    timestamps = _SHARE_RATE_LIMITS.setdefault(uid, [])
+    # Prune timestamps older than 1 hour
+    _SHARE_RATE_LIMITS[uid] = [t for t in timestamps if t > cutoff]
+
+    if len(_SHARE_RATE_LIMITS[uid]) >= max_shares:
+        return False, f"Rate limit reached ({max_shares} files/hr)"
+
+    _SHARE_RATE_LIMITS[uid].append(now)
+    return True, ""
+
+
+def reset_share_rate_limits() -> None:
+    """Clear in-memory share rate limits (useful for test isolation)."""
+    _SHARE_RATE_LIMITS.clear()
+
+
+def log_file_audit(
+    user_id: int | str,
+    action: str,
+    path: Path | str,
+    size: float | int | str,
+    route: str,
+    status: str,
+) -> None:
+    """Append one line to DATA_DIR/file_audit.log."""
+    if not getattr(config, "FILE_AUDIT_LOG", True):
+        return
+    try:
+        data_dir = Path(getattr(config, "DATA_DIR", "data"))
+        data_dir.mkdir(parents=True, exist_ok=True)
+        log_file = data_dir / "file_audit.log"
+        iso_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        line = f"{iso_ts} | user_id={user_id} | action={action} | path={path} | size={size} | route={route} | status={status}\n"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception as exc:
+        log.warning("Failed writing to file_audit.log: %s", exc)
 
 
 def is_reparse_point(path: Path | str) -> bool:

@@ -386,13 +386,16 @@ async def handle_callback_query(
         await query.edit_message_text("✅ Approved! Executing…")
         try:
             # 1. Execute plugin directly
+            exec_kwargs = dict(pending.get("kwargs") or {})
+            if pending.get("tool_name") == "share_file":
+                exec_kwargs["user_id"] = user_id
             plugin = _orchestrator.registry.get(pending["tool_name"]) if _orchestrator else None
             if plugin is not None:
-                result = await plugin.execute(**pending["kwargs"])
+                result = await plugin.execute(**exec_kwargs)
             elif _orchestrator:
                 result = await _orchestrator.run_tool(
                     tool_name=pending["tool_name"],
-                    kwargs=pending["kwargs"],
+                    kwargs=exec_kwargs,
                     chat_id=query.message.chat_id,
                 )
             else:
@@ -536,6 +539,19 @@ async def handle_callback_query(
             )
     else:
         sm.cancel_by_id(approval_id)
+        if pending and pending.get("tool_name") == "share_file":
+            kw = pending.get("kwargs") or {}
+            target_p = kw.get("path") or kw.get("query") or "unknown"
+            deliv = kw.get("delivery", "telegram")
+            from plugins.file_search import log_file_audit  # noqa: PLC0415
+            log_file_audit(
+                user_id=user_id,
+                action="share",
+                path=target_p,
+                size="0",
+                route=deliv,
+                status="cancelled",
+            )
         await query.edit_message_text("❌ Action cancelled.")
 
 

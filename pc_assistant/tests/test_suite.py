@@ -2683,16 +2683,56 @@ class TestFileSearch(unittest.TestCase):
         from plugins.file_search import is_sensitive_path
         sensitive = [
             ".env",
+            ".env.local",
+            ".env.production",
             "project/.env",
             "production.env",
             "server.key",
             "cert.pem",
+            "cert.pfx",
+            "cert.p12",
+            "vpn.ovpn",
+            "passwords.kdbx",
+            "app.keystore",
+            "my_wallet.keystore",
             "id_rsa",
             "id_rsa.pub",
+            "id_ed25519",
+            "id_ed25519.pub",
             ".ssh/id_rsa",
+            ".ssh/config",
+            ".gnupg/pubring.kbx",
+            ".aws/credentials",
+            ".azure/tokens.json",
+            ".kube/config",
+            ".docker/config.json",
+            ".config/gcloud/credentials.db",
+            ".git-credentials",
+            ".netrc",
+            ".npmrc",
+            ".pypirc",
+            "Login Data",
+            "Cookies",
+            "Web Data",
+            "Local State",
+            "key4.db",
+            "logins.json",
+            "Google/Chrome/User Data/Default/History",
+            "Microsoft/Edge/User Data/Default/Cookies",
+            "Mozilla/Firefox/Profiles/abc.default/key4.db",
+            "BraveSoftware/Brave-Browser/User Data",
+            "NTUSER.DAT",
+            "C:/Windows/System32/config/SAM",
+            "C:/Windows/System32/config/SYSTEM",
+            "C:/Windows/System32/config/SECURITY",
+            "/etc/shadow",
+            "/etc/sudoers",
+            "wallet.dat",
+            "keystore.json",
             "pc_assistant/credentials/gmail_oauth.json",
             "credentials/gmail_token.json",
             "data/history.db",
+            "data/file_index.db",
             "data/memory_db/chroma.sqlite3",
             "whatsapp_session/client.json",
         ]
@@ -2706,6 +2746,9 @@ class TestFileSearch(unittest.TestCase):
             "dataset.csv",
             "notes.txt",
             "src/main.py",
+            "security_brief.docx",
+            "system_metrics.json",
+            "sam_intro.pptx",
         ]
         for s in safe:
             self.assertFalse(is_sensitive_path(s), f"Expected {s} to be safe")
@@ -3204,6 +3247,85 @@ class TestFilesPlugins(unittest.TestCase):
                         res = _run(plugin.execute(query="massive.iso"))
                         self.assertFalse(res.success)
                         self.assertIn("too large", res.output.lower())
+
+    def test_soft_warning_in_preview(self):
+        from plugins.p_files import ShareFilePlugin
+        plugin = ShareFilePlugin()
+
+        with tempfile.TemporaryDirectory() as td:
+            # File outside usual folders and with sensitive word
+            sec_file = Path(td) / "my_secret_token_report.pdf"
+            sec_file.write_text("dummy")
+
+            preview = _run(plugin.prepare_preview({"path": str(sec_file)}))
+            self.assertIsNotNone(preview)
+            self.assertIn("⚠️ Note: file is outside your usual folders", preview)
+            self.assertIn("⚠️ Note: filename looks sensitive", preview)
+
+            # Normal file inside fake Documents folder
+            docs_dir = Path(td) / "Documents"
+            docs_dir.mkdir()
+            normal_file = docs_dir / "simple_presentation.pptx"
+            normal_file.write_text("presentation")
+
+            preview_normal = _run(plugin.prepare_preview({"path": str(normal_file)}))
+            self.assertIsNotNone(preview_normal)
+            self.assertNotIn("⚠️ Note: file is outside your usual folders", preview_normal)
+            self.assertNotIn("⚠️ Note: filename looks sensitive", preview_normal)
+
+    def test_share_rate_limiter(self):
+        import config
+        from plugins.file_search import check_and_increment_share_limit, reset_share_rate_limits
+        from plugins.p_files import ShareFilePlugin
+
+        reset_share_rate_limits()
+        plugin = ShareFilePlugin()
+        user_id = 777
+
+        # First 20 shares succeed
+        for i in range(20):
+            allowed, msg = check_and_increment_share_limit(user_id=user_id)
+            self.assertTrue(allowed, f"Share {i+1} should be allowed")
+            self.assertEqual(msg, "")
+
+        # 21st share trips the rate limiter
+        allowed_21, msg_21 = check_and_increment_share_limit(user_id=user_id)
+        self.assertFalse(allowed_21)
+        self.assertIn("Rate limit reached (20 files/hr)", msg_21)
+
+        # Execution also returns failure
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "sample.txt"
+            f.write_text("data")
+            res = _run(plugin.execute(path=str(f), user_id=user_id))
+            self.assertFalse(res.success)
+            self.assertIn("Rate limit reached", res.output)
+
+        reset_share_rate_limits()
+
+    def test_audit_log_appends_entry(self):
+        import config
+        from plugins.file_search import log_file_audit
+
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(config, "DATA_DIR", td):
+                log_file_audit(
+                    user_id=456,
+                    action="share",
+                    path="test_contract.pdf",
+                    size="2.4 MB",
+                    route="Telegram",
+                    status="approved",
+                )
+                audit_log = Path(td) / "file_audit.log"
+                self.assertTrue(audit_log.exists())
+                content = audit_log.read_text(encoding="utf-8")
+                self.assertIn("user_id=456", content)
+                self.assertIn("action=share", content)
+                self.assertIn("test_contract.pdf", content)
+                self.assertIn("size=2.4 MB", content)
+                self.assertIn("route=Telegram", content)
+                self.assertIn("status=approved", content)
 
 
 class TestGmailPluginAttachment(unittest.TestCase):
