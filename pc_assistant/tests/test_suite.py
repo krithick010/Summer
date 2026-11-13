@@ -3075,7 +3075,7 @@ class TestFilesPlugins(unittest.TestCase):
         self.assertEqual(plugin.name, "share_file")
         self.assertTrue(plugin.requires_approval)
         self.assertIn("path", plugin.parameters_schema["required"])
-        self.assertNotIn("query", plugin.parameters_schema.get("properties", {}))
+        self.assertIn("query", plugin.parameters_schema.get("properties", {}))
 
     def test_share_file_prepare_preview(self):
         import config
@@ -3493,7 +3493,7 @@ class TestPhase2DeterministicFileTools(unittest.TestCase):
         from plugins.p_files import ShareFilePlugin
         p = ShareFilePlugin()
         self.assertEqual(p.parameters_schema["required"], ["path"])
-        self.assertNotIn("query", p.parameters_schema["properties"])
+        self.assertIn("query", p.parameters_schema["properties"])
 
     def test_orchestrator_returns_choices_reply(self):
         from core.orchestrator import ChoicesReply, Orchestrator
@@ -3791,11 +3791,11 @@ class TestPhase4HonestyAndFormatting(unittest.TestCase):
             prompt,
         )
         self.assertIn(
-            "find_files: use for when they ask to find, locate or send a file or folder (always search first)",
+            "find_files: use for when they ask to search, find, or locate files by keyword",
             prompt,
         )
         self.assertIn(
-            "share_file: use for only with an exact path from find_files or typed by the user",
+            "share_file: use for when they ask to send, share, upload, or email a specific file or folder (pass the path or filename)",
             prompt,
         )
 
@@ -4243,6 +4243,183 @@ class TestPhase1FolderAliases(unittest.TestCase):
                 res = _run(plugin.execute(path="target.pdf"))
                 self.assertTrue(res.success)
                 self.assertIn("target.pdf", res.output)
+
+
+class TestPhase2ShareFileResolution(unittest.TestCase):
+    """Test smart share_file query resolution, pre-approval validation, and oversized limits."""
+
+    def test_resolve_share_target_variations(self):
+        import config
+        from plugins.file_search import resolve_share_target
+
+        with tempfile.TemporaryDirectory() as td:
+            fake_home = Path(td) / "home"
+            fake_home.mkdir()
+            dl = fake_home / "Downloads"
+            dl.mkdir()
+            doc = dl / "resume.pdf"
+            doc.write_text("my resume")
+
+            # Ambiguous files in td
+            a1 = dl / "report_2025.txt"
+            a2 = dl / "report_2026.txt"
+            a1.write_text("2025")
+            a2.write_text("2026")
+
+            with patch("pathlib.Path.home", return_value=fake_home):
+                with patch.object(config, "FILE_SEARCH_ROOTS", str(dl)):
+                    # 1. Non-existent file
+                    path, matches, err = resolve_share_target("ghost_file_xyz.doc")
+                    self.assertIsNone(path)
+                    self.assertEqual(matches, [])
+                    self.assertIn("No file found matching", err)
+
+                    # 2. Existing via alias / hallucinated path
+                    path, matches, err = resolve_share_target(r"C:\Users\friend\Downloads\resume.pdf")
+                    self.assertIsNone(err)
+                    self.assertIsNotNone(path)
+                    self.assertEqual(path.resolve(), doc.resolve())
+
+                    # 3. Stem match
+                    path, matches, err = resolve_share_target("resume")
+                    self.assertIsNone(err)
+                    self.assertIsNotNone(path)
+                    self.assertEqual(path.resolve(), doc.resolve())
+
+                    # 4. Ambiguous match returns multiple matches, no path
+                    path, matches, err = resolve_share_target("report")
+                    self.assertIsNone(path)
+                    self.assertIsNone(err)
+                    self.assertGreaterEqual(len(matches), 2)
+
+    def test_orchestrator_share_file_hallucinated_path_resolves_before_approval(self):
+        import config
+        from core.orchestrator import Orchestrator
+        from core.state_manager import StateManager
+
+        with tempfile.TemporaryDirectory() as td:
+            fake_home = Path(td) / "home"
+            fake_home.mkdir()
+            dl = fake_home / "Downloads"
+            dl.mkdir()
+            real_file = dl / "thesis.pdf"
+            real_file.write_text("my thesis")
+
+            mock_llm = MagicMock()
+            mock_llm.chat = AsyncMock(return_value={
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "function": {
+                        "name": "share_file",
+                        "arguments": {"path": r"C:\Users\wronguser\Downloads\thesis.pdf"},
+                    },
+                }],
+            })
+
+            sm = StateManager()
+            orch = Orchestrator(llm=mock_llm, state_manager=sm)
+            orch.set_hitl_builder(lambda approval_id, preview_text, tool_name: {
+                "text": preview_text,
+                "reply_markup": MagicMock(),
+            })
+
+            with patch("pathlib.Path.home", return_value=fake_home):
+                with patch.object(config, "FILE_SEARCH_ROOTS", str(dl)):
+                    res = _run(orch.handle_user_message(10, 10, "send my thesis"))
+                    self.assertIsInstance(res, dict)
+                    self.assertIn("thesis.pdf", res["text"])
+                    # State manager should have recorded the REAL resolved path
+                    approval_id = sm._user_index.get(10)
+                    pending = sm.get_action(approval_id) if approval_id else None
+                    self.assertIsNotNone(pending)
+                    self.assertEqual(pending.kwargs["path"], str(real_file.resolve()))
+                    self.assertEqual(orch.last_file_path[10], str(real_file.resolve()))
+
+    def test_orchestrator_share_file_nonexistent_returns_direct_reply_without_hitl(self):
+        from core.orchestrator import Orchestrator
+        from core.state_manager import StateManager
+
+        mock_llm = MagicMock()
+        mock_llm.chat = AsyncMock(return_value={
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_1",
+                "function": {
+                    "name": "share_file",
+                    "arguments": {"path": "ghost_document.pdf"},
+                },
+            }],
+        })
+
+        sm = StateManager()
+        orch = Orchestrator(llm=mock_llm, state_manager=sm)
+        orch.set_hitl_builder(lambda approval_id, preview_text, tool_name: {
+            "text": preview_text,
+            "reply_markup": MagicMock(),
+        })
+
+        res = _run(orch.handle_user_message(20, 20, "send ghost document"))
+        self.assertIsInstance(res, str)
+        self.assertIn("No file found matching", res)
+        # Verify NO pending approval was created
+        self.assertNotIn(20, sm._user_index)
+
+    def test_orchestrator_share_file_ambiguous_returns_choices(self):
+        import config
+        from core.orchestrator import ChoicesReply, Orchestrator
+        from core.state_manager import StateManager
+
+        with tempfile.TemporaryDirectory() as td:
+            f1 = Path(td) / "contract_v1.docx"
+            f2 = Path(td) / "contract_v2.docx"
+            f1.write_text("v1")
+            f2.write_text("v2")
+
+            mock_llm = MagicMock()
+            mock_llm.chat = AsyncMock(return_value={
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "function": {
+                        "name": "share_file",
+                        "arguments": {"path": "contract"},
+                    },
+                }],
+            })
+
+            sm = StateManager()
+            orch = Orchestrator(llm=mock_llm, state_manager=sm)
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                res = _run(orch.handle_user_message(30, 30, "send contract"))
+                self.assertIsInstance(res, ChoicesReply)
+                self.assertIn("contract_v1.docx", res.text)
+                self.assertIn("contract_v2.docx", res.text)
+                self.assertNotIn(30, sm._user_index)
+
+    def test_oversized_file_error_message_no_email_suggestion(self):
+        import config
+        from plugins.p_files import ShareFilePlugin
+
+        plugin = ShareFilePlugin()
+        with tempfile.TemporaryDirectory() as td:
+            doc = Path(td) / "big_dump.iso"
+            doc.write_bytes(b"0" * 100)
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                with patch("plugins.p_files.compress_to_zip") as mock_zip:
+                    zip_mock = Path(td) / "big_dump.iso.zip"
+                    zip_mock.write_bytes(b"123")
+                    mock_zip.return_value = zip_mock
+
+                    with patch("os.path.getsize", return_value=500 * 1024 * 1024):
+                        res = _run(plugin.execute(query="big_dump.iso"))
+                        self.assertFalse(res.success)
+                        self.assertIn("exceeds the maximum transfer limit", res.output)
+                        self.assertNotIn("consider using email for files under 25 mb", res.output.lower())
 
 
 if __name__ == "__main__":

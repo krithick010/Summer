@@ -1080,6 +1080,77 @@ def find_files(query: str, file_type: str = "", max_results: int = 5) -> list[Pa
     return [m.path for m in matches]
 
 
+def resolve_share_target(raw_input: str) -> tuple[Path | None, list[FileMatch], str | None]:
+    """Resolve raw input (path, filename, keywords, or alias) to a local file or folder.
+
+    Returns:
+        (resolved_path, matches, error_message)
+        - If resolved to a single valid path: (Path, matches, None)
+        - If ambiguous (multiple matches): (None, matches, None)
+        - If not found or access blocked: (None, [], error_str)
+    """
+    if not raw_input or not str(raw_input).strip():
+        return None, [], "Please specify the file or folder path to share."
+
+    clean_input = str(raw_input).strip().strip("'\"").strip()
+    if not clean_input:
+        return None, [], "Please specify the file or folder path to share."
+
+    # 1. Try resolve_user_path (handles aliases like "Downloads", "~", hallucinated users, relative tails)
+    cand = resolve_user_path(clean_input)
+    if cand is not None and cand.exists():
+        if is_sensitive_path(cand):
+            return None, [], f"⚠️ Access denied: '{cand.name}' is a protected or sensitive file."
+        return cand, [], None
+
+    # 2. Try direct path on disk
+    try:
+        direct_p = Path(os.path.expandvars(os.path.expanduser(clean_input))).resolve()
+        if direct_p.exists():
+            if is_sensitive_path(direct_p):
+                return None, [], f"⚠️ Access denied: '{direct_p.name}' is a protected or sensitive file."
+            return direct_p, [], None
+    except Exception:
+        pass
+
+    # 3. Strip fake/hallucinated directory prefix or search with clean input
+    matches = search_files(clean_input)
+    if not matches and ("/" in clean_input or "\\" in clean_input):
+        leaf = Path(clean_input).name
+        if leaf and leaf != clean_input:
+            matches = search_files(leaf)
+
+    if not matches:
+        return None, [], f"No file found matching '{raw_input}'."
+
+    # 4. Check single match vs multiple matches
+    if len(matches) == 1:
+        target = matches[0].path
+        if is_sensitive_path(target):
+            return None, [], f"⚠️ Access denied: '{target.name}' is a protected or sensitive file."
+        return target, matches, None
+
+    # Check for 1 exact Tier-A stem or filename match among multiple matches
+    q_name = Path(clean_input).name.lower()
+    q_stem = Path(clean_input).stem.lower()
+
+    exact_names = [m for m in matches if m.path.name.lower() == q_name]
+    if len(exact_names) == 1:
+        target = exact_names[0].path
+        if is_sensitive_path(target):
+            return None, [], f"⚠️ Access denied: '{target.name}' is a protected or sensitive file."
+        return target, matches, None
+
+    exact_stems = [m for m in matches if m.path.stem.lower() == q_stem]
+    if len(exact_stems) == 1:
+        target = exact_stems[0].path
+        if is_sensitive_path(target):
+            return None, [], f"⚠️ Access denied: '{target.name}' is a protected or sensitive file."
+        return target, matches, None
+
+    return None, matches, None
+
+
 def compress_to_zip(target: Path, dest_dir: Path) -> Path:
     """Compress a single file or directory into ``dest_dir / f'{target.name}.zip'``.
 

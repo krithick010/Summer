@@ -9,6 +9,7 @@ No classifier layers, no keyword guardrails, no fast-paths.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 import importlib
 import inspect
 import logging
@@ -27,6 +28,7 @@ from core.memory import MemoryManager
 from core.state_manager import StateManager, state_manager as default_state_manager
 import plugins
 from plugins.base import PluginBase, PluginResult
+from plugins.file_search import resolve_share_target
 
 log = logging.getLogger(__name__)
 
@@ -128,6 +130,7 @@ class Orchestrator:
         self.memory = memory or MemoryManager()
         self.choice_store = choice_store or default_choice_store
         self.history = History()
+        self.last_file_path: dict[int, str] = {}
         self.registry: dict[str, PluginBase] = {}
         self._hitl_builder: Callable[..., dict[str, Any]] | None = None
         self._bg_tasks: set[asyncio.Task[Any]] = set()
@@ -316,6 +319,78 @@ class Orchestrator:
                     if name == "find_files" and "query" not in filtered_args and "path" in call_args:
                         filtered_args["query"] = call_args["path"]
 
+                    if name == "share_file":
+                        if "path" not in filtered_args and "query" in call_args:
+                            filtered_args["path"] = call_args["query"]
+                        raw_target = str(
+                            filtered_args.get("path")
+                            or filtered_args.get("query")
+                            or call_args.get("path")
+                            or call_args.get("query")
+                            or ""
+                        ).strip()
+                        if raw_target.lower() in ("it", "this", "that", "the file", "the folder") and user_id in self.last_file_path:
+                            raw_target = self.last_file_path[user_id]
+                            filtered_args["path"] = raw_target
+
+                        msg_lower = message.lower()
+                        if ("mail" in msg_lower or "email" in msg_lower) and "delivery" not in filtered_args:
+                            filtered_args["delivery"] = "email"
+
+                        # Pre-approval validation
+                        target_path, matches, err_msg = await asyncio.to_thread(resolve_share_target, raw_target)
+                        if err_msg:
+                            reply_text = str(err_msg)
+                            self.history.add(user_id, "user", message)
+                            self.history.add(user_id, assistant_turn)
+                            self.history.add(user_id, {"role": "tool", "tool_name": name, "content": reply_text})
+                            self.history.add(user_id, "assistant", reply_text)
+                            if EXTRACTOR_ENABLED:
+                                task = asyncio.create_task(self._remember(hist, message))
+                                self._bg_tasks.add(task)
+                                task.add_done_callback(self._bg_tasks.discard)
+                            return reply_text
+
+                        if not target_path and matches:
+                            top_matches = matches[:5]
+                            lines = []
+                            choices = []
+                            is_email = filtered_args.get("delivery") == "email"
+                            to_email = filtered_args.get("to_email", "")
+                            for idx, m in enumerate(top_matches, start=1):
+                                size_mb = m.size / (1024 * 1024)
+                                size_str = f"{size_mb:.1f} MB"
+                                date_str = datetime.fromtimestamp(m.mtime).strftime("%Y-%m-%d")
+                                folder_name = m.path.parent.name
+                                lines.append(f"{idx}. {m.path.name} - {size_str} - {date_str} - in {folder_name}")
+                                kw = {"path": str(m.path.resolve())}
+                                if is_email:
+                                    kw["delivery"] = "email"
+                                    if to_email:
+                                        kw["to_email"] = to_email
+                                choices.append({
+                                    "label": f"{idx}. {m.path.name} ({size_str})",
+                                    "tool": "share_file",
+                                    "kwargs": kw,
+                                })
+                            list_text = "\n".join(lines)
+                            reply_text = f"Found multiple files matching '{raw_target}':\n{list_text}\nTap one to send it."
+                            token = self.choice_store.register(user_id, choices)
+                            labels = [str(c.get("label", "")) for c in choices]
+                            self.history.add(user_id, "user", message)
+                            self.history.add(user_id, assistant_turn)
+                            self.history.add(user_id, {"role": "tool", "tool_name": name, "content": reply_text})
+                            self.history.add(user_id, "assistant", reply_text)
+                            if EXTRACTOR_ENABLED:
+                                task = asyncio.create_task(self._remember(hist, message))
+                                self._bg_tasks.add(task)
+                                task.add_done_callback(self._bg_tasks.discard)
+                            return ChoicesReply(text=reply_text, token=token, labels=labels)
+
+                        if target_path:
+                            filtered_args["path"] = str(target_path.resolve())
+                            self.last_file_path[user_id] = str(target_path.resolve())
+
                     if plugin.requires_approval:
                         self.history.add(user_id, "user", message)
                         self.history.add(user_id, assistant_turn)
@@ -332,6 +407,12 @@ class Orchestrator:
                     if len(calls) == 1 and isinstance(res.data, dict):
                         choices = res.data.get("choices")
                         if choices and isinstance(choices, list):
+                            if "mail" in message.lower() or "email" in message.lower():
+                                for c in choices:
+                                    if isinstance(c, dict) and "kwargs" in c:
+                                        c["kwargs"]["delivery"] = "email"
+                            if res.data.get("matches"):
+                                self.last_file_path[user_id] = str(res.data["matches"][0])
                             token = self.choice_store.register(user_id, choices)
                             labels = [str(c.get("label", "")) for c in choices]
                             reply_text = str(res.data.get("direct_reply") or res.output or "")

@@ -26,6 +26,7 @@ from plugins.file_search import (
     is_sensitive_path,
     is_soft_sensitive,
     log_file_audit,
+    resolve_share_target,
     search_files,
     split_file_chunks,
 )
@@ -49,7 +50,7 @@ class FindFilesPlugin(PluginBase):
     description = (
         "Searches for files or folders on the local PC matching a name, keywords, or path."
     )
-    usage_hint = "when they ask to find, locate or send a file or folder (always search first)"
+    usage_hint = "when they ask to search, find, or locate files by keyword"
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -125,13 +126,17 @@ class ShareFilePlugin(PluginBase):
     description = (
         "Finds, prepares, and shares a local file or folder via Telegram or email."
     )
-    usage_hint = "only with an exact path from find_files or typed by the user"
+    usage_hint = "when they ask to send, share, upload, or email a specific file or folder (pass the path or filename)"
     parameters_schema = {
         "type": "object",
         "properties": {
             "path": {
                 "type": "string",
-                "description": "Absolute path of the file or folder to share",
+                "description": "File path, filename, or search keywords for the file/folder to send",
+            },
+            "query": {
+                "type": "string",
+                "description": "Optional search keywords alias for file or folder to send",
             },
             "delivery": {
                 "type": "string",
@@ -157,17 +162,12 @@ class ShareFilePlugin(PluginBase):
         if not path_str:
             return None
 
-        target = Path(path_str)
-        if not target.is_absolute() and not target.exists():
-            matches = await asyncio.to_thread(find_files, path_str)
-            if matches:
-                target = matches[0]
+        target, matches, err_msg = await asyncio.to_thread(resolve_share_target, path_str)
+        if err_msg or not target:
+            return f"• Path: {path_str}\n• Status: File not found"
 
         if is_sensitive_path(target):
             return f"• Path: {target}\n• File: {target.name}\n• Security: Blocked (sensitive file)"
-
-        if not target.exists():
-            return f"• Path: {target}\n• File: {target.name}\n• Status: File not found"
 
         try:
             if target.is_dir():
@@ -206,23 +206,59 @@ class ShareFilePlugin(PluginBase):
                 error="Missing required path parameter",
             )
 
-        target = Path(path_str)
-        if not target.is_absolute() and not target.exists():
-            matches = await asyncio.to_thread(find_files, path_str)
+        resolved_path, matches, err_msg = await asyncio.to_thread(resolve_share_target, path_str)
+        if err_msg:
+            return PluginResult(
+                success=False,
+                output=err_msg,
+                error=err_msg,
+                data={"direct_reply": err_msg},
+            )
+
+        if not resolved_path:
             if matches:
-                target = matches[0]
-            else:
+                top_matches = matches[:5]
+                lines = []
+                choices = []
+                is_email = (delivery == "email") or ("email" in delivery) or ("mail" in delivery)
+                for idx, m in enumerate(top_matches, start=1):
+                    size_mb = m.size / (1024 * 1024)
+                    size_str = f"{size_mb:.1f} MB"
+                    date_str = datetime.fromtimestamp(m.mtime).strftime("%Y-%m-%d")
+                    folder_name = m.path.parent.name
+                    lines.append(f"{idx}. {m.path.name} - {size_str} - {date_str} - in {folder_name}")
+                    kw = {"path": str(m.path.resolve())}
+                    if is_email:
+                        kw["delivery"] = "email"
+                        if to_email:
+                            kw["to_email"] = to_email
+                    choices.append({
+                        "label": f"{idx}. {m.path.name} ({size_str})",
+                        "tool": "share_file",
+                        "kwargs": kw,
+                    })
+                list_text = "\n".join(lines)
+                direct_reply = f"Found multiple files matching '{path_str}':\n{list_text}\nTap one to send it."
                 return PluginResult(
-                    success=False,
-                    output=f"Could not find any file or folder for '{path_str}'.",
-                    error=f"File not found: {path_str}",
+                    success=True,
+                    output=direct_reply,
+                    data={"choices": choices, "direct_reply": direct_reply, "matches": [str(m.path) for m in top_matches]},
                 )
+            return PluginResult(
+                success=False,
+                output=f"No file found matching '{path_str}'.",
+                error=f"File not found: {path_str}",
+                data={"direct_reply": f"No file found matching '{path_str}'."},
+            )
+
+        target = resolved_path
 
         if not target.exists():
             return PluginResult(
                 success=False,
                 output=f"⚠️ Target path does not exist: `{target}`",
                 error=f"Target path not found: {target}",
+                data={"direct_reply": f"⚠️ Target path does not exist: `{target}`"},
             )
 
         if is_sensitive_path(target):
@@ -230,6 +266,7 @@ class ShareFilePlugin(PluginBase):
                 success=False,
                 output=f"⚠️ Access denied: '{target.name}' is a protected or sensitive file.",
                 error="Sensitive file access blocked",
+                data={"direct_reply": f"⚠️ Access denied: '{target.name}' is a protected or sensitive file."},
             )
 
         # Rate limit check
@@ -436,13 +473,14 @@ class ShareFilePlugin(PluginBase):
                 route=delivery,
                 status="error",
             )
+            limit_msg = (
+                f"⚠️ File '{target.name}' is too large ({size_mb:.1f} MB), which exceeds the maximum transfer limit "
+                f"({config.FILE_MAX_SPLIT_MB:.0f} MB via Telegram multi-part and 25 MB via Gmail)."
+            )
             return PluginResult(
                 success=False,
-                output=(
-                    f"⚠️ File '{target.name}' is too large ({size_mb:.1f} MB). "
-                    f"Telegram bots can only upload files up to 50 MB (or split up to {config.FILE_MAX_SPLIT_MB:.0f} MB). "
-                    "Consider using email for files under 25 MB, or choose a smaller file."
-                ),
+                output=limit_msg,
+                data={"direct_reply": limit_msg},
                 error=f"File exceeds maximum split limit of {config.FILE_MAX_SPLIT_MB} MB",
             )
 
