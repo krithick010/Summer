@@ -203,6 +203,15 @@ HISTORY_DB_PATH=:memory:
 
 ---
 
+## 📁 File Sharing & Delivery Limits
+
+Summer allows searching and sending local files via Telegram or email:
+- **Telegram Bot API Limit**: Standard Telegram bots can upload files up to **50 MB** per request. For files exceeding 50 MB (up to 150 MB), Summer automatically splits them into sequential 45 MB chunks with rejoining instructions.
+- **Local Bot API Server Note**: Standard cloud Telegram servers enforce the 50 MB file upload limit. Running a self-hosted [local Telegram Bot API server](https://core.telegram.org/bots/api#using-a-local-bot-api-server) lifts this limit up to 2,000 MB (2 GB).
+- **Email Route**: Files can also be sent as attachments via Gmail (subject to Gmail's 25 MB limit).
+
+---
+
 ## 🧪 Testing
 
 Run the full automated test suite:

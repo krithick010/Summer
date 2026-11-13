@@ -11,11 +11,13 @@ from datetime import datetime
 import logging
 import os
 from pathlib import Path
+import time
 from typing import Any
 
 import config
 from plugins.base import PluginBase, PluginResult
 from plugins.file_search import (
+    ALREADY_COMPRESSED_EXTENSIONS,
     compress_to_zip,
     find_files,
     get_search_roots,
@@ -220,8 +222,10 @@ class ShareFilePlugin(PluginBase):
         # Handle directory compression
         if target.is_dir():
             try:
-                send_path = compress_to_zip(target, tmp_shares_dir)
+                t0 = time.perf_counter()
+                send_path = await asyncio.to_thread(compress_to_zip, target, tmp_shares_dir)
                 is_temp_zip = True
+                log.info("Compressed directory '%s' in %.1f ms", target.name, (time.perf_counter() - t0) * 1000)
             except Exception as exc:
                 return PluginResult(
                     success=False,
@@ -258,11 +262,14 @@ class ShareFilePlugin(PluginBase):
                     error="Missing recipient email",
                 )
 
-            if size_mb > 25.0 and not is_temp_zip:
+            is_already_compressed = (not target.is_dir()) and (target.suffix.lower() in ALREADY_COMPRESSED_EXTENSIONS)
+            if size_mb > 25.0 and not is_temp_zip and not is_already_compressed:
                 try:
-                    send_path = compress_to_zip(send_path, tmp_shares_dir)
+                    t0 = time.perf_counter()
+                    send_path = await asyncio.to_thread(compress_to_zip, send_path, tmp_shares_dir)
                     is_temp_zip = True
                     size_mb = os.path.getsize(str(send_path)) / (1024 * 1024)
+                    log.info("Compressed file for email in %.1f ms", (time.perf_counter() - t0) * 1000)
                 except Exception as exc:
                     return PluginResult(
                         success=False,
@@ -322,44 +329,92 @@ class ShareFilePlugin(PluginBase):
                 },
             )
 
-        # Multi-part split Telegram route (50 MB - FILE_MAX_SPLIT_MB)
-        if size_mb <= config.FILE_MAX_SPLIT_MB:
+        # File is > 50 MB. Skip zipping if already compressed; zip only text-like files and directories.
+        is_already_compressed = (not target.is_dir()) and (target.suffix.lower() in ALREADY_COMPRESSED_EXTENSIONS)
+        if not is_already_compressed and not is_temp_zip:
             try:
-                parts = split_file_chunks(send_path, chunk_size_mb=45.0)
+                t0 = time.perf_counter()
+                send_path = await asyncio.to_thread(compress_to_zip, send_path, tmp_shares_dir)
+                is_temp_zip = True
+                size_mb = os.path.getsize(str(send_path)) / (1024 * 1024)
+                log.info("Compressed text-like file '%s' in %.1f ms", target.name, (time.perf_counter() - t0) * 1000)
             except Exception as exc:
-                if is_temp_zip:
-                    send_path.unlink(missing_ok=True)
                 return PluginResult(
                     success=False,
-                    output=f"⚠️ Failed to split '{send_path.name}': {exc}",
+                    output=f"⚠️ Failed to compress '{send_path.name}': {exc}",
                     error=str(exc),
                 )
 
-            send_files = [
-                {
-                    "path": str(part),
-                    "filename": part.name,
-                    "kind": "document",
-                    "cleanup": True,
-                }
-                for part in parts
-            ]
-            direct_reply = f"Sent: {send_path.name} ({size_mb:.1f} MB) in {len(parts)} parts via Telegram."
+        # If compression brought it under 50 MB:
+        if size_mb <= config.FILE_TELEGRAM_MAX_MB:
+            direct_reply = f"Sent: {send_path.name} ({size_mb:.1f} MB) via Telegram."
             return PluginResult(
                 success=True,
                 output=direct_reply,
-                data={"direct_reply": direct_reply, "send_files": send_files},
+                data={
+                    "direct_reply": direct_reply,
+                    "send_files": [
+                        {
+                            "path": str(send_path),
+                            "filename": send_path.name,
+                            "kind": "document",
+                            "cleanup": is_temp_zip,
+                        }
+                    ],
+                },
             )
 
-        # Exceeds maximum split limit
-        if is_temp_zip:
-            send_path.unlink(missing_ok=True)
+        # Over FILE_MAX_SPLIT_MB (default 150 MB)
+        if size_mb > config.FILE_MAX_SPLIT_MB:
+            if is_temp_zip:
+                send_path.unlink(missing_ok=True)
+            return PluginResult(
+                success=False,
+                output=(
+                    f"⚠️ File '{target.name}' is too large ({size_mb:.1f} MB). "
+                    f"Telegram bots can only upload files up to 50 MB (or split up to {config.FILE_MAX_SPLIT_MB:.0f} MB). "
+                    "Consider using email for files under 25 MB, or choose a smaller file."
+                ),
+                error=f"File exceeds maximum split limit of {config.FILE_MAX_SPLIT_MB} MB",
+            )
 
+        # Multi-part split Telegram route (50 MB - FILE_MAX_SPLIT_MB)
+        try:
+            t0 = time.perf_counter()
+            parts = await asyncio.to_thread(
+                split_file_chunks,
+                send_path,
+                chunk_size_mb=45.0,
+                dest_dir=tmp_shares_dir,
+                remove_source=is_temp_zip,
+            )
+            log.info("Split '%s' into %d parts in %.1f ms", send_path.name, len(parts), (time.perf_counter() - t0) * 1000)
+        except Exception as exc:
+            if is_temp_zip:
+                send_path.unlink(missing_ok=True)
+            return PluginResult(
+                success=False,
+                output=f"⚠️ Failed to split '{send_path.name}': {exc}",
+                error=str(exc),
+            )
+
+        send_files = [
+            {
+                "path": str(part),
+                "filename": part.name,
+                "kind": "document",
+                "cleanup": True,
+            }
+            for part in parts
+        ]
+        win_join = "+".join(f'"{p.name}"' for p in parts)
+        join_hint = f'To join parts (Windows: copy /b {win_join} "{target.name}" ; Linux/macOS: cat "{target.name}.part"* > "{target.name}").'
+        direct_reply = (
+            f"Sent: {target.name} ({size_mb:.1f} MB) in {len(parts)} parts via Telegram.\n"
+            f"{join_hint}"
+        )
         return PluginResult(
-            success=False,
-            output=(
-                f"⚠️ File '{target.name}' is too large ({size_mb:.1f} MB). "
-                f"Maximum allowed size for sharing is {config.FILE_MAX_SPLIT_MB} MB."
-            ),
-            error=f"File exceeds maximum split limit of {config.FILE_MAX_SPLIT_MB} MB",
+            success=True,
+            output=direct_reply,
+            data={"direct_reply": direct_reply, "send_files": send_files},
         )

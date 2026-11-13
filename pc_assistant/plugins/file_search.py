@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import time
 from typing import Sequence
 import zipfile
@@ -22,6 +23,12 @@ import zipfile
 import config
 
 log = logging.getLogger(__name__)
+
+ALREADY_COMPRESSED_EXTENSIONS: set[str] = {
+    ".docx", ".xlsx", ".pptx", ".zip", ".rar", ".7z",
+    ".mp4", ".mkv", ".mov", ".jpg", ".jpeg", ".png",
+    ".pdf", ".mp3",
+}
 
 # Security denylist: sensitive files, keys, credentials, and state databases
 SENSITIVE_NAMES = {
@@ -544,25 +551,56 @@ def compress_to_zip(target: Path, dest_dir: Path) -> Path:
     return zip_path
 
 
-def split_file_chunks(source_zip: Path, chunk_size_mb: float = 45.0) -> list[Path]:
-    """Split ``source_zip`` into sequential binary chunks (.part01, .part02, ...) and remove source."""
-    if not source_zip.exists():
-        raise FileNotFoundError(f"Source file does not exist: {source_zip}")
+def split_file_chunks(
+    source_file: Path,
+    chunk_size_mb: float = 45.0,
+    dest_dir: Path | None = None,
+    remove_source: bool | None = None,
+) -> list[Path]:
+    """Split ``source_file`` into sequential binary chunks (.part01, .part02, ...)."""
+    if not source_file.exists():
+        raise FileNotFoundError(f"Source file does not exist: {source_file}")
 
     chunk_bytes = max(1024, int(chunk_size_mb * 1024 * 1024))
-    dest_dir = source_zip.parent
+    target_dir = dest_dir or source_file.parent
+    target_dir.mkdir(parents=True, exist_ok=True)
     parts: list[Path] = []
     part_idx = 1
 
-    with open(source_zip, "rb") as f:
+    with open(source_file, "rb") as f:
         while True:
             chunk = f.read(chunk_bytes)
             if not chunk:
                 break
-            part_path = dest_dir / f"{source_zip.name}.part{part_idx:02d}"
+            part_path = target_dir / f"{source_file.name}.part{part_idx:02d}"
             part_path.write_bytes(chunk)
             parts.append(part_path)
             part_idx += 1
 
-    source_zip.unlink(missing_ok=True)
+    if remove_source is None:
+        remove_source = source_file.suffix.lower() == ".zip"
+    if remove_source:
+        source_file.unlink(missing_ok=True)
     return parts
+
+
+def cleanup_stale_tmp_shares(max_age_s: float = 86400.0) -> int:
+    """Remove leftover files in DATA_DIR / tmp_shares older than max_age_s (default 24h)."""
+    tmp_shares_dir = Path(config.DATA_DIR) / "tmp_shares"
+    if not tmp_shares_dir.exists():
+        return 0
+    now = time.time()
+    removed = 0
+    for item in tmp_shares_dir.iterdir():
+        try:
+            if (now - item.stat().st_mtime) > max_age_s:
+                if item.is_file():
+                    item.unlink(missing_ok=True)
+                    removed += 1
+                elif item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                    removed += 1
+        except Exception as exc:
+            log.warning("Failed to clean up stale tmp_share %s: %s", item, exc)
+    return removed
+

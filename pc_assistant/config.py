@@ -137,6 +137,8 @@ FILE_SEARCH_ROOTS: str = os.getenv("FILE_SEARCH_ROOTS", "")
 FILE_TELEGRAM_MAX_MB: float = float(os.getenv("FILE_TELEGRAM_MAX_MB", "50.0"))
 # Maximum post-zip file size (MB) eligible for multi-part 45 MB chunks over Telegram
 FILE_MAX_SPLIT_MB: float = float(os.getenv("FILE_MAX_SPLIT_MB", "150.0"))
+# File upload timeout in seconds for Telegram send_document and send_photo
+FILE_UPLOAD_TIMEOUT_S: float = float(os.getenv("FILE_UPLOAD_TIMEOUT_S", "600.0"))
 # Default email address to send files to when delivery is email
 USER_DEFAULT_EMAIL: str = os.getenv("USER_DEFAULT_EMAIL", "")
 

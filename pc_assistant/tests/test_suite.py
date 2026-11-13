@@ -24,7 +24,7 @@ import time
 import unittest
 import warnings
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 
 # ---------------------------------------------------------------------------
 # Hermetic environment settings for tests (must be set BEFORE project imports)
@@ -3364,6 +3364,183 @@ class TestPhase2DeterministicFileTools(unittest.TestCase):
             for line in f:
                 if line.startswith("import ") or line.startswith("from "):
                     self.assertNotIn("telegram", line, f"Orchestrator must not import telegram: {line}")
+
+
+class TestPhase3ReliableDelivery(unittest.TestCase):
+    """Hermetic unit tests for Phase 3 timeouts, splitting, and delivery."""
+
+    def test_upload_timeouts_passed_to_telegram(self):
+        import main
+        import config
+        from plugins.base import PluginResult
+        fake_plugin = MagicMock()
+        fake_result = PluginResult(
+            success=True,
+            output="Sent",
+            data={
+                "send_files": [
+                    {"path": "dummy.pdf", "filename": "dummy.pdf", "kind": "document", "cleanup": False}
+                ]
+            },
+        )
+        fake_plugin.execute = AsyncMock(return_value=fake_result)
+        mock_sm = MagicMock()
+        mock_sm.resolve.return_value = {"tool_name": "share_file", "kwargs": {}}
+        mock_orch = MagicMock()
+        mock_orch.registry = {"share_file": fake_plugin}
+        mock_orch.state_manager = mock_sm
+        mock_orch.history.get.return_value = []
+        mock_orch.resume_tool_loop = AsyncMock(return_value="Done")
+
+        mock_query = MagicMock()
+        mock_query.from_user.id = 1
+        mock_query.data = "hitl:approve:123"
+        mock_query.message.chat_id = 123
+        mock_query.answer = AsyncMock()
+        mock_query.edit_message_text = AsyncMock()
+
+        mock_context = MagicMock()
+        mock_context.bot.send_chat_action = AsyncMock()
+        mock_context.bot.send_document = AsyncMock()
+        mock_context.bot.send_message = AsyncMock()
+
+        mock_update = MagicMock()
+        mock_update.callback_query = mock_query
+
+        with patch("pathlib.Path.exists", return_value=True):
+            with patch("builtins.open", mock_open(read_data=b"data")):
+                with patch.object(main, "_orchestrator", mock_orch):
+                    with patch.object(main, "_is_allowed", return_value=True):
+                        with patch.object(config, "FILE_UPLOAD_TIMEOUT_S", 720.0):
+                            _run(main.handle_callback_query(mock_update, mock_context))
+
+        mock_context.bot.send_chat_action.assert_awaited()
+        mock_context.bot.send_document.assert_awaited_once()
+        kwargs = mock_context.bot.send_document.call_args[1]
+        self.assertEqual(kwargs.get("read_timeout"), 720.0)
+        self.assertEqual(kwargs.get("write_timeout"), 720.0)
+        self.assertEqual(kwargs.get("connect_timeout"), 720.0)
+        self.assertEqual(kwargs.get("pool_timeout"), 720.0)
+
+    def test_timedout_stops_later_parts_and_reports(self):
+        import main
+        import telegram.error
+        from plugins.base import PluginResult
+        fake_plugin = MagicMock()
+        fake_result = PluginResult(
+            success=True,
+            output="Sent",
+            data={
+                "send_files": [
+                    {"path": "part1.dat", "filename": "part1.dat", "kind": "document", "cleanup": True},
+                    {"path": "part2.dat", "filename": "part2.dat", "kind": "document", "cleanup": True},
+                    {"path": "part3.dat", "filename": "part3.dat", "kind": "document", "cleanup": True},
+                ]
+            },
+        )
+        fake_plugin.execute = AsyncMock(return_value=fake_result)
+        mock_sm = MagicMock()
+        mock_sm.resolve.return_value = {"tool_name": "share_file", "kwargs": {}}
+        mock_orch = MagicMock()
+        mock_orch.registry = {"share_file": fake_plugin}
+        mock_orch.state_manager = mock_sm
+        mock_orch.history.get.return_value = []
+        mock_orch.resume_tool_loop = AsyncMock(return_value="Done")
+
+        mock_query = MagicMock()
+        mock_query.from_user.id = 1
+        mock_query.data = "hitl:approve:123"
+        mock_query.message.chat_id = 123
+        mock_query.answer = AsyncMock()
+        mock_query.edit_message_text = AsyncMock()
+
+        mock_context = MagicMock()
+        mock_context.bot.send_chat_action = AsyncMock()
+        # Raise TimedOut on first part
+        mock_context.bot.send_document = AsyncMock(side_effect=telegram.error.TimedOut("Connection timed out"))
+        mock_context.bot.send_message = AsyncMock()
+
+        mock_update = MagicMock()
+        mock_update.callback_query = mock_query
+
+        with patch("pathlib.Path.exists", return_value=True):
+            with patch("builtins.open", mock_open(read_data=b"data")):
+                with patch.object(main, "_orchestrator", mock_orch):
+                    with patch.object(main, "_is_allowed", return_value=True):
+                        _run(main.handle_callback_query(mock_update, mock_context))
+
+        # Stopped after part 1: send_document called only once, later parts not attempted
+        self.assertEqual(mock_context.bot.send_document.await_count, 1)
+        # Sent timeout message
+        reported = False
+        for call in mock_context.bot.send_message.call_args_list:
+            if "Telegram timed out on part 1" in str(call):
+                reported = True
+                break
+        self.assertTrue(reported)
+
+    def test_docx_over_50mb_split_raw_no_zip(self):
+        import config
+        from plugins.p_files import ShareFilePlugin
+        plugin = ShareFilePlugin()
+        with tempfile.TemporaryDirectory() as td:
+            docx = Path(td) / "big_report.docx"
+            docx.write_bytes(b"x" * 100)
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                with patch("plugins.p_files.compress_to_zip") as mock_zip:
+                    with patch("plugins.p_files.split_file_chunks") as mock_split:
+                        mock_split.return_value = [Path(td) / "big_report.docx.part01", Path(td) / "big_report.docx.part02"]
+                        with patch("os.path.getsize", return_value=60 * 1024 * 1024):
+                            res = _run(plugin.execute(path=str(docx)))
+                            self.assertTrue(res.success)
+                            # Zipping was SKIPPED for .docx
+                            mock_zip.assert_not_called()
+                            # split_file_chunks was called directly
+                            mock_split.assert_called_once()
+                            self.assertEqual(len(res.data["send_files"]), 2)
+                            self.assertIn("copy /b", res.output)
+
+    def test_text_directory_is_zipped(self):
+        import config
+        from plugins.p_files import ShareFilePlugin
+        plugin = ShareFilePlugin()
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td) / "text_project"
+            folder.mkdir()
+            (folder / "notes.txt").write_text("notes")
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                with patch("plugins.p_files.compress_to_zip") as mock_zip:
+                    zip_out = Path(td) / "text_project.zip"
+                    zip_out.write_bytes(b"zip")
+                    mock_zip.return_value = zip_out
+                    with patch("os.path.getsize", return_value=5 * 1024 * 1024):
+                        res = _run(plugin.execute(path=str(folder)))
+                        self.assertTrue(res.success)
+                        mock_zip.assert_called_once()
+                        self.assertEqual(res.data["send_files"][0]["path"], str(zip_out))
+
+    def test_startup_cleanup_removes_old_temp_files(self):
+        import config
+        from plugins.file_search import cleanup_stale_tmp_shares
+        with tempfile.TemporaryDirectory() as td:
+            tmp_shares = Path(td) / "tmp_shares"
+            tmp_shares.mkdir()
+            old_file = tmp_shares / "old_part.01"
+            old_file.write_text("old")
+            new_file = tmp_shares / "new_part.01"
+            new_file.write_text("new")
+
+            # Set mtime of old_file to 48 hours ago
+            old_mtime = time.time() - (48 * 3600)
+            os.utime(str(old_file), (old_mtime, old_mtime))
+
+            with patch.object(config, "DATA_DIR", td):
+                removed = cleanup_stale_tmp_shares(max_age_s=86400.0)
+                self.assertEqual(removed, 1)
+                self.assertFalse(old_file.exists())
+                self.assertTrue(new_file.exists())
 
 
 if __name__ == "__main__":

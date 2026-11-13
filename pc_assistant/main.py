@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import telegram.error
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from telegram import (
@@ -99,20 +100,29 @@ async def _safe_send_message(
 ) -> Any:
     """Send a message using Markdown, falling back to plain text if Telegram fails parsing entities."""
     try:
-        return await bot.send_message(
+        coro = bot.send_message(
             chat_id=chat_id,
             text=text,
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=reply_markup,
             link_preview_options=_NO_LINK_PREVIEW,
         )
+        if asyncio.iscoroutine(coro):
+            return await coro
+        return coro
     except Exception:
-        return await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=reply_markup,
-            link_preview_options=_NO_LINK_PREVIEW,
-        )
+        try:
+            coro = bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+                link_preview_options=_NO_LINK_PREVIEW,
+            )
+            if asyncio.iscoroutine(coro):
+                return await coro
+            return coro
+        except Exception:
+            return None
 
 
 async def _safe_reply_text(
@@ -377,6 +387,7 @@ async def handle_callback_query(
                 result = None
 
             # 2. Upload files if the approved plugin returned send_files
+            timed_out_part: int | None = None
             if (
                 result
                 and result.success
@@ -384,28 +395,76 @@ async def handle_callback_query(
                 and "send_files" in result.data
             ):
                 send_files = result.data.get("send_files") or []
-                for item in send_files:
+                total_parts = len(send_files)
+                upload_timeout = config.FILE_UPLOAD_TIMEOUT_S
+
+                for idx, item in enumerate(send_files, start=1):
                     f_path = Path(item["path"])
                     kind = item.get("kind", "document")
                     filename = item.get("filename") or f_path.name
                     try:
                         if f_path.exists():
+                            # Send chat action before each upload
+                            action_type = (
+                                ChatAction.UPLOAD_PHOTO if kind == "photo" else ChatAction.UPLOAD_DOCUMENT
+                            )
+                            try:
+                                action_res = context.bot.send_chat_action(
+                                    chat_id=query.message.chat_id,
+                                    action=action_type,
+                                )
+                                if asyncio.iscoroutine(action_res):
+                                    await action_res
+                            except Exception:
+                                pass
+
+                            if total_parts > 1:
+                                await _safe_send_message(
+                                    context.bot,
+                                    chat_id=query.message.chat_id,
+                                    text=f"Sending part {idx} of {total_parts}...",
+                                )
+
                             with open(f_path, "rb") as f:
                                 if kind == "photo":
                                     await context.bot.send_photo(
                                         chat_id=query.message.chat_id,
                                         photo=f,
                                         caption=filename,
+                                        read_timeout=upload_timeout,
+                                        write_timeout=upload_timeout,
+                                        connect_timeout=upload_timeout,
+                                        pool_timeout=upload_timeout,
                                     )
                                 else:
                                     await context.bot.send_document(
                                         chat_id=query.message.chat_id,
                                         document=f,
                                         filename=filename,
+                                        read_timeout=upload_timeout,
+                                        write_timeout=upload_timeout,
+                                        connect_timeout=upload_timeout,
+                                        pool_timeout=upload_timeout,
                                     )
+                    except telegram.error.TimedOut:
+                        timed_out_part = idx
+                        log.warning("Telegram upload timed out on part %d (%s)", idx, filename)
+                        await _safe_send_message(
+                            context.bot,
+                            chat_id=query.message.chat_id,
+                            text=f"Telegram timed out on part {idx} - it may still arrive. Check before asking again.",
+                        )
+                        break
                     finally:
                         if item.get("cleanup"):
                             f_path.unlink(missing_ok=True)
+
+                if timed_out_part is not None:
+                    # Clean up remaining un-sent parts
+                    for rem_item in send_files[timed_out_part:]:
+                        if rem_item.get("cleanup"):
+                            Path(rem_item["path"]).unlink(missing_ok=True)
+                    return
 
             result_output = result.output if result else "Action completed."
 
@@ -550,6 +609,11 @@ async def lifespan(app: FastAPI):  # noqa: ANN001
 
     # Import orchestrator (triggers plugin auto-discovery)
     from core.orchestrator import Orchestrator  # noqa: PLC0415
+    from plugins.file_search import cleanup_stale_tmp_shares  # noqa: PLC0415
+
+    cleaned_count = cleanup_stale_tmp_shares(max_age_s=86400.0)
+    if cleaned_count:
+        log.info("Startup cleanup: removed %d stale temp share file(s)", cleaned_count)
 
     _orchestrator = Orchestrator()
     _orchestrator.set_hitl_builder(build_hitl_prompt)
