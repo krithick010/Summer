@@ -131,6 +131,8 @@ HITL_TIMEOUT_SECONDS: int = int(os.getenv("HITL_TIMEOUT_SECONDS", "120"))
 # ---------------------------------------------------------------------------
 # File Sharing & Search
 # ---------------------------------------------------------------------------
+# Deterministic intent routing for file-related requests before calling LLM
+FILE_ROUTER: bool = os.getenv("FILE_ROUTER", "true").strip().lower() in ("true", "1", "yes")
 # Search mode: "home" (default), "all_drives", or "custom"
 FILE_SEARCH_MODE: str = os.getenv("FILE_SEARCH_MODE", "home").strip().lower()
 # Optional comma-separated root paths to search (empty = priority user folders then home)

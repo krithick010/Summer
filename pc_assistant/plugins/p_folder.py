@@ -60,6 +60,16 @@ class ListFolderPlugin(PluginBase):
         "required": [],
     }
 
+    def match_intent(self, message: str, ctx: Any) -> Any:
+        from core.intent_router import match_file_intent  # noqa: PLC0415
+        from plugins.base import IntentContext, RoutedCall  # noqa: PLC0415
+        if isinstance(ctx, dict):
+            ctx = IntentContext(user_id=ctx.get("user_id", 0), last_file_path=ctx.get("last_file_path", ""), last_query=ctx.get("last_query", ""))
+        res = match_file_intent(message, ctx)
+        if res and res.tool_name == self.name:
+            return res
+        return None
+
     async def execute(self, **kwargs: Any) -> PluginResult:
         raw_path = str(kwargs.get("path") or "").strip()
         try:

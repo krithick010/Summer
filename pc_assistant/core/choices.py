@@ -33,6 +33,14 @@ class ChoiceStore:
         }
         return token
 
+    def has_pending(self, user_id: int) -> bool:
+        """Return True if user has any active unexpired choices."""
+        now = time.time()
+        for v in self._stores.values():
+            if v.get("user_id") == user_id and now <= v.get("expires_at", 0):
+                return True
+        return False
+
     def get(self, token: str, user_id: int, index: int) -> dict[str, Any] | None:
         """Retrieve a specific choice if token is valid, unexpired, and matches user_id."""
         now = time.time()

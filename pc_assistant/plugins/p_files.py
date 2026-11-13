@@ -62,6 +62,16 @@ class FindFilesPlugin(PluginBase):
     }
     requires_approval = False
 
+    def match_intent(self, message: str, ctx: Any) -> Any:
+        from core.intent_router import match_file_intent  # noqa: PLC0415
+        from plugins.base import IntentContext, RoutedCall  # noqa: PLC0415
+        if isinstance(ctx, dict):
+            ctx = IntentContext(user_id=ctx.get("user_id", 0), last_file_path=ctx.get("last_file_path", ""), last_query=ctx.get("last_query", ""))
+        res = match_file_intent(message, ctx)
+        if res and res.tool_name == self.name:
+            return res
+        return None
+
     async def execute(self, **kwargs: Any) -> PluginResult:
         query = str(kwargs.get("query") or kwargs.get("path") or "").strip()
 
@@ -156,6 +166,16 @@ class ShareFilePlugin(PluginBase):
         "required": ["path"],
     }
     requires_approval = True
+
+    def match_intent(self, message: str, ctx: Any) -> Any:
+        from core.intent_router import match_file_intent  # noqa: PLC0415
+        from plugins.base import IntentContext, RoutedCall  # noqa: PLC0415
+        if isinstance(ctx, dict):
+            ctx = IntentContext(user_id=ctx.get("user_id", 0), last_file_path=ctx.get("last_file_path", ""), last_query=ctx.get("last_query", ""))
+        res = match_file_intent(message, ctx)
+        if res and res.tool_name == self.name:
+            return res
+        return None
 
     async def prepare_preview(self, kwargs: dict[str, Any]) -> str | None:
         """Resolve target file and build a rich HITL approval preview."""

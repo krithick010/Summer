@@ -3818,11 +3818,11 @@ class TestPhase4HonestyAndFormatting(unittest.TestCase):
         from core.orchestrator import Orchestrator
         orch = Orchestrator(llm=MagicMock())
         orch.llm.chat = AsyncMock(return_value={"role": "assistant", "content": "Found it!"})
-        _run(orch.handle_user_message(user_id=1, chat_id=1, message=r"Aicte final, docs file in krith\downloads"))
+        _run(orch.handle_user_message(user_id=1, chat_id=1, message=r"Can you explain the path my_project\subfolder?"))
         sent_msgs = orch.llm.chat.call_args[0][0]
         user_msg = next(m["content"] for m in sent_msgs if m.get("role") == "user")
-        self.assertNotIn(r"krith\downloads", user_msg)
-        self.assertIn("krith/downloads", user_msg)
+        self.assertNotIn(r"my_project\subfolder", user_msg)
+        self.assertIn("my_project/subfolder", user_msg)
 
     def test_approval_card_html_escaped_preserves_underscores(self):
         import main
@@ -4935,6 +4935,375 @@ class TestPhase4TelegramAwarenessAndNoDoubleReply(unittest.TestCase):
             self.assertEqual(mock_context.bot.send_message.call_args.kwargs["text"], "Sent: photo.jpg via Telegram.")
         finally:
             main._orchestrator = orig_orch
+
+
+class TestPhase3FileIntentRouter(unittest.TestCase):
+    """Hermetic unit tests for Phase 3: Deterministic file intent router (R1–R7)."""
+
+    def setUp(self):
+        from core.choices import ChoiceStore
+        from core.state_manager import StateManager
+        self.sm = StateManager()
+        self.cs = ChoiceStore()
+
+    def test_r1_bare_path_and_alias_routing(self):
+        from core.intent_router import classify_file_intent
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "direct.txt"
+            f.write_text("hello")
+            sub = Path(td) / "my_dir"
+            sub.mkdir()
+
+            # Bare file path -> share_file
+            res = classify_file_intent(str(f))
+            self.assertIsNotNone(res)
+            self.assertEqual(res[0], "share_file")
+            self.assertEqual(res[1]["path"], str(f.resolve()))
+
+            # Bare directory alias -> share_file (default unless list command)
+            res_alias = classify_file_intent("Downloads")
+            self.assertIsNotNone(res_alias)
+            self.assertEqual(res_alias[0], "share_file")
+
+            # "list" with directory path -> list_folder
+            res_list = classify_file_intent(f"list {sub}")
+            self.assertIsNotNone(res_list)
+            self.assertEqual(res_list[0], "list_folder")
+            self.assertEqual(res_list[1]["path"], str(sub.resolve()))
+
+    def test_r2_send_command_variations(self):
+        from core.intent_router import classify_file_intent
+
+        res1 = classify_file_intent("Send me aicte final file")
+        self.assertIsNotNone(res1)
+        self.assertEqual(res1[0], "share_file")
+        self.assertEqual(res1[1]["path"], "aicte final file")
+
+        res2 = classify_file_intent("sent me aicte final file")
+        self.assertIsNotNone(res2)
+        self.assertEqual(res2[0], "share_file")
+        self.assertEqual(res2[1]["path"], "aicte final file")
+
+        res3 = classify_file_intent("share report.pdf")
+        self.assertIsNotNone(res3)
+        self.assertEqual(res3[0], "share_file")
+        self.assertEqual(res3[1]["path"], "report.pdf")
+
+        res4 = classify_file_intent("get me thesis.docx")
+        self.assertIsNotNone(res4)
+        self.assertEqual(res4[0], "share_file")
+        self.assertEqual(res4[1]["path"], "thesis.docx")
+
+        # Email delivery routing
+        res_email = classify_file_intent("email me resume.pdf")
+        self.assertIsNotNone(res_email)
+        self.assertEqual(res_email[0], "share_file")
+        self.assertEqual(res_email[1]["delivery"], "email")
+
+    def test_r3_find_search_variations(self):
+        from core.intent_router import classify_file_intent
+
+        res1 = classify_file_intent("find tree.txt")
+        self.assertIsNotNone(res1)
+        self.assertEqual(res1[0], "find_files")
+        self.assertEqual(res1[1]["query"], "tree.txt")
+
+        res2 = classify_file_intent("search for annual financial report")
+        self.assertIsNotNone(res2)
+        self.assertEqual(res2[0], "find_files")
+        self.assertEqual(res2[1]["query"], "annual financial report")
+
+        res3 = classify_file_intent("where is thesis.pdf")
+        self.assertIsNotNone(res3)
+        self.assertEqual(res3[0], "find_files")
+        self.assertEqual(res3[1]["query"], "thesis.pdf")
+
+    def test_r4_list_browse_variations(self):
+        from core.intent_router import classify_file_intent
+
+        res1 = classify_file_intent("list documents")
+        self.assertIsNotNone(res1)
+        self.assertEqual(res1[0], "list_folder")
+        self.assertIn("documents", res1[1]["path"].lower())
+
+        res2 = classify_file_intent("what's in downloads")
+        self.assertIsNotNone(res2)
+        self.assertEqual(res2[0], "list_folder")
+        self.assertIn("downloads", res2[1]["path"].lower())
+
+        res3 = classify_file_intent("browse folder /tmp/data")
+        self.assertIsNotNone(res3)
+        self.assertEqual(res3[0], "list_folder")
+        self.assertEqual(res3[1]["path"], "/tmp/data")
+
+    def test_r5_bare_filename_with_extension(self):
+        from core.intent_router import classify_file_intent
+
+        res1 = classify_file_intent("tree.txt")
+        self.assertIsNotNone(res1)
+        self.assertEqual(res1[0], "share_file")
+        self.assertEqual(res1[1]["path"], "tree.txt")
+
+        res2 = classify_file_intent("aicte final.docx")
+        self.assertIsNotNone(res2)
+        self.assertEqual(res2[0], "share_file")
+        self.assertEqual(res2[1]["path"], "aicte final.docx")
+
+        # Typo extension (.rxt)
+        res3 = classify_file_intent("tree.rxt")
+        self.assertIsNotNone(res3)
+        self.assertEqual(res3[0], "share_file")
+        self.assertEqual(res3[1]["path"], "tree.rxt")
+
+    def test_r6_single_token_index_vocab_match(self):
+        from core.intent_router import classify_file_intent
+
+        fake_vocab = {"tree", "wallpaper", "report", "statement", "annual"}
+        with patch("plugins.file_index.file_indexer.get_vocabulary", return_value=fake_vocab):
+            # Single bare word without extension must NEVER be routed (rule R4 requirement)
+            res1 = classify_file_intent("tree")
+            self.assertIsNone(res1)
+
+            res2 = classify_file_intent("wallpapr")
+            self.assertIsNone(res2)
+
+            # >= 2 name tokens matching vocabulary should route
+            res3 = classify_file_intent("annual report")
+            self.assertIsNotNone(res3)
+            self.assertEqual(res3[0], "share_file")
+            self.assertEqual(res3[1]["path"], "annual report")
+
+            # Non-file conversational words should NOT match
+            self.assertIsNone(classify_file_intent("hello"))
+            self.assertIsNone(classify_file_intent("thanks"))
+
+    def test_r7_capitalized_multiword_vocab_match(self):
+        from core.intent_router import classify_file_intent
+
+        fake_vocab = {"aicte", "final", "whatsapp", "image", "annual", "budget"}
+        with patch("plugins.file_index.file_indexer.get_vocabulary", return_value=fake_vocab):
+            res1 = classify_file_intent("Aicte Final")
+            self.assertIsNotNone(res1)
+            self.assertEqual(res1[0], "share_file")
+            self.assertEqual(res1[1]["path"], "Aicte Final")
+
+            res2 = classify_file_intent("WhatsApp Image")
+            self.assertIsNotNone(res2)
+            self.assertEqual(res2[0], "share_file")
+            self.assertEqual(res2[1]["path"], "WhatsApp Image")
+
+    def test_background_failures_zero_llm_calls(self):
+        """Verify the 7 real Telegram failures run through Orchestrator with ZERO LLM calls."""
+        import config
+        from core.llm_engine import LLMEngine
+        from core.orchestrator import Orchestrator
+
+        mock_llm = MagicMock(spec=LLMEngine)
+        mock_llm.chat = AsyncMock()
+
+        orch = Orchestrator(llm=mock_llm, state_manager=self.sm, choice_store=self.cs)
+        orch.set_hitl_builder(lambda **kw: {"text": "approval card"})
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            # Create files matching the 7 background cases
+            (base / "aicte final.docx").write_text("aicte data")
+            (base / "tree.txt").write_text("tree data")
+            (base / "WhatsApp Image.jpg").write_text("image data")
+            wp_dir = base / "potential wallpapers"
+            wp_dir.mkdir()
+            (wp_dir / "wallpaper1.jpg").write_text("wp data")
+
+            fake_vocab = {"aicte", "final", "tree", "whatsapp", "image", "wallpapers", "potential"}
+
+            queries = [
+                "Aicte final",
+                "Tree.txt",
+                "Sent me aicte final file",
+                "tree.txt in desktop",
+                "potential wallpapers folder",
+                "WhatsApp image",
+                "tree.rxt",
+            ]
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", str(base)), \
+                 patch.object(config, "FILE_SEARCH_MODE", "custom"), \
+                 patch.object(config, "FILE_ROUTER", True), \
+                 patch("plugins.file_index.file_indexer.get_vocabulary", return_value=fake_vocab):
+
+                for idx, q in enumerate(queries):
+                    mock_llm.chat.reset_mock()
+                    res = _run(orch.handle_user_message(10 + idx, 10 + idx, q))
+                    # ZERO LLM calls must be made!
+                    mock_llm.chat.assert_not_called()
+                    self.assertIsNotNone(res)
+
+    def test_non_file_queries_flow_to_llm(self):
+        """Verify weather, news, and conversation fall through to normal LLM loop."""
+        import config
+        from core.llm_engine import LLMEngine
+        from core.orchestrator import Orchestrator
+
+        mock_llm = MagicMock(spec=LLMEngine)
+        mock_llm.chat = AsyncMock(return_value={"content": "Paris is sunny today."})
+
+        orch = Orchestrator(llm=mock_llm, state_manager=self.sm, choice_store=self.cs)
+
+        with patch.object(config, "FILE_ROUTER", True):
+            res = _run(orch.handle_user_message(1, 1, "what is the weather in Paris"))
+            mock_llm.chat.assert_called()
+            self.assertEqual(res, "Paris is sunny today.")
+
+            mock_llm.chat.reset_mock()
+            mock_llm.chat.return_value = {"content": "Here is the AI news."}
+            res_news = _run(orch.handle_user_message(1, 1, "show AI news"))
+            mock_llm.chat.assert_called()
+            self.assertEqual(res_news, "Here is the AI news.")
+
+    def test_file_router_disabled_falls_back_to_llm(self):
+        """When FILE_ROUTER is False, requests fall through to LLM."""
+        import config
+        from core.llm_engine import LLMEngine
+        from core.orchestrator import Orchestrator
+
+        mock_llm = MagicMock(spec=LLMEngine)
+        mock_llm.chat = AsyncMock(return_value={"content": "I can help with tree.txt"})
+
+        orch = Orchestrator(llm=mock_llm, state_manager=self.sm, choice_store=self.cs)
+
+        with patch.object(config, "FILE_ROUTER", False):
+            res = _run(orch.handle_user_message(1, 1, "tree.txt"))
+            mock_llm.chat.assert_called()
+
+    def test_phase3_pure_intent_router_table(self):
+        """Test pure router rules R1-R7 across all required prompt test cases."""
+        import time
+        from core.intent_router import match_file_intent
+        from plugins.base import IntentContext
+
+        # 1. "Tree.txt"
+        r = match_file_intent("Tree.txt")
+        self.assertIsNotNone(r)
+        self.assertEqual(r.rule, "R2")
+        self.assertEqual(r.tool_name, "share_file")
+
+        # 2. "tree.txt ig"
+        r = match_file_intent("tree.txt ig")
+        self.assertIsNotNone(r)
+        self.assertEqual(r.rule, "R2")
+        self.assertEqual(r.tool_name, "share_file")
+
+        # 3. "report_final"
+        fake_vocab = {"report", "final"}
+        with patch("plugins.file_index.file_indexer.get_vocabulary", return_value=fake_vocab):
+            r = match_file_intent("report_final")
+            self.assertIsNotNone(r)
+            self.assertEqual(r.rule, "R4")
+            self.assertEqual(r.tool_name, "share_file")
+
+        # 4. "Sent me report final file"
+        r = match_file_intent("Sent me report final file")
+        self.assertIsNotNone(r)
+        self.assertEqual(r.rule, "R3")
+        self.assertEqual(r.tool_name, "share_file")
+
+        # 5. "Shre me the sample wallpapers folder"
+        r = match_file_intent("Shre me the sample wallpapers folder")
+        self.assertIsNotNone(r)
+        self.assertEqual(r.rule, "R3")
+        self.assertEqual(r.tool_name, "share_file")
+
+        # 6. "Ahre me the tree.txt file"
+        r = match_file_intent("Ahre me the tree.txt file")
+        self.assertIsNotNone(r)
+        self.assertEqual(r.rule, "R2")
+        self.assertEqual(r.tool_name, "share_file")
+
+        # 7. "It's in desktop" after a miss
+        ctx = IntentContext(last_query="tree.txt", timestamps={"last_query": time.time()})
+        r = match_file_intent("It's in desktop", ctx)
+        self.assertIsNotNone(r)
+        self.assertEqual(r.rule, "R6")
+        self.assertEqual(r.tool_name, "share_file")
+        self.assertIn("desktop", r.kwargs["path"])
+
+        # 8. "tree.txt in documents/research notes/dsa"
+        r = match_file_intent("tree.txt in documents/research notes/dsa")
+        self.assertIsNotNone(r)
+        self.assertEqual(r.rule, "R2")
+        self.assertEqual(r.tool_name, "share_file")
+
+        # 9. "Find me gmail_oauth.json"
+        r = match_file_intent("Find me gmail_oauth.json")
+        self.assertIsNotNone(r)
+        self.assertEqual(r.tool_name, "find_files")
+        self.assertIn("gmail_oauth.json", r.kwargs["query"])
+
+        # 10. "Mail it" after a lookup (email route)
+        ctx = IntentContext(last_file_path="/path/to/report.pdf", timestamps={"last_file_path": time.time()})
+        r = match_file_intent("Mail it", ctx)
+        self.assertIsNotNone(r)
+        self.assertEqual(r.rule, "R5")
+        self.assertEqual(r.tool_name, "share_file")
+        self.assertEqual(r.kwargs["delivery"], "email")
+
+        # 11. "Mail it to mom" (NOT routed)
+        r = match_file_intent("Mail it to mom", ctx)
+        self.assertIsNone(r)
+
+        # 12. "list downloads"
+        r = match_file_intent("list downloads")
+        self.assertIsNotNone(r)
+        self.assertEqual(r.rule, "R7")
+        self.assertEqual(r.tool_name, "list_folder")
+
+        # 13. "What is in my Downloads"
+        r = match_file_intent("What is in my Downloads")
+        self.assertIsNotNone(r)
+        self.assertEqual(r.rule, "R7")
+        self.assertEqual(r.tool_name, "list_folder")
+
+        # 14. "hi" (NOT routed)
+        self.assertIsNone(match_file_intent("hi"))
+
+        # 15. "yo" (NOT routed)
+        self.assertIsNone(match_file_intent("yo"))
+
+        # 16. "how's the weather?" (NOT routed)
+        self.assertIsNone(match_file_intent("how's the weather?"))
+
+        # 17. "any ai news?" (NOT routed)
+        self.assertIsNone(match_file_intent("any ai news?"))
+
+        # 18. "who is Ada Lovelace on wikipedia" (NOT routed)
+        self.assertIsNone(match_file_intent("who is Ada Lovelace on wikipedia"))
+
+        # 19. "email my mom saying hi" (NOT routed)
+        self.assertIsNone(match_file_intent("email my mom saying hi"))
+
+        # 20. "weather" (bare single word, NOT routed)
+        self.assertIsNone(match_file_intent("weather"))
+
+    def test_routed_message_recorded_in_history_without_llm(self):
+        """A routed message never calls llm.chat and still lands in history."""
+        import config
+        from core.llm_engine import LLMEngine
+        from core.orchestrator import Orchestrator
+
+        mock_llm = MagicMock(spec=LLMEngine)
+        orch = Orchestrator(llm=mock_llm, state_manager=self.sm, choice_store=self.cs)
+
+        with patch.object(config, "FILE_ROUTER", True):
+            res = _run(orch.handle_user_message(42, 42, "list downloads"))
+            mock_llm.chat.assert_not_called()
+            self.assertIsNotNone(res)
+
+            # Check history
+            hist = orch.history.get(42)
+            self.assertTrue(len(hist) >= 2)
+            self.assertEqual(hist[0]["role"], "user")
+            self.assertEqual(hist[0]["content"], "list downloads")
+            self.assertEqual(hist[-1]["role"], "assistant")
 
 
 if __name__ == "__main__":

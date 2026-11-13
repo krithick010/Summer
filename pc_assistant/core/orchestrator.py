@@ -28,7 +28,7 @@ from core.memory import MemoryManager
 from core.state_manager import StateManager, state_manager as default_state_manager
 import plugins
 from plugins.base import PluginBase, PluginResult
-from plugins.file_search import resolve_share_target
+from plugins.file_search import format_size, resolve_share_target
 
 log = logging.getLogger(__name__)
 
@@ -137,6 +137,8 @@ class Orchestrator:
         self._hitl_builder: Callable[..., dict[str, Any]] | None = None
         self._bg_tasks: set[asyncio.Task[Any]] = set()
         self._load_plugins()
+        from core.intent_router import IntentRouter  # noqa: PLC0415
+        self.intent_router = IntentRouter(self.registry)
 
     def set_hitl_builder(self, fn: Callable[..., dict[str, Any]]) -> None:
         """Register the callable from main.py that builds Telegram inline-keyboard dicts."""
@@ -263,6 +265,137 @@ class Orchestrator:
         retrieval_ms = 0.0
         try:
             hist = self.history.get(user_id)
+
+            # 1. Check if a pending HITL / choices flow exists for the user
+            has_pending_hitl = False
+            if hasattr(self, "state_manager") and self.state_manager:
+                pending_aid = self.state_manager._user_index.get(user_id)
+                if pending_aid:
+                    action = self.state_manager.get_action(pending_aid)
+                    if action and not action.is_expired():
+                        has_pending_hitl = True
+
+            has_pending_choices = False
+            if hasattr(self, "choice_store") and self.choice_store:
+                if hasattr(self.choice_store, "has_pending"):
+                    has_pending_choices = self.choice_store.has_pending(user_id)
+
+            # 2. Deterministic file intent router
+            if getattr(config, "FILE_ROUTER", True) and not has_pending_hitl and not has_pending_choices:
+                routed = None
+                if hasattr(self, "intent_router") and self.intent_router:
+                    routed = self.intent_router.route(user_id, message)
+
+                if routed:
+                    log.info("router: rule=%s tool=%s kwargs=%r", routed.rule, routed.tool_name, routed.kwargs)
+                    name = routed.tool_name
+                    filtered_args = dict(routed.kwargs)
+                    filtered_args["user_id"] = user_id
+                    routed_plugin = self.registry.get(name)
+
+                    raw_target = str(
+                        filtered_args.get("path")
+                        or filtered_args.get("query")
+                        or ""
+                    ).strip()
+
+                    self.intent_router.update_context(user_id, last_query=raw_target)
+
+                    if name == "share_file":
+                        # Pre-approval validation
+                        target_path, matches, err_msg = await asyncio.to_thread(resolve_share_target, raw_target)
+                        if err_msg:
+                            reply_text = str(err_msg)
+                            self.history.add(user_id, "user", message)
+                            self.history.add(user_id, "assistant", reply_text)
+                            tot_ms = (time.perf_counter() - t_msg) * 1000.0
+                            log.info("Orchestrator timing | retrieval_ms=0.0 handle_user_message_ms=%.1f", tot_ms)
+                            return reply_text
+
+                        if not target_path and matches:
+                            top_matches = matches[:5]
+                            lines = []
+                            choices = []
+                            is_email = filtered_args.get("delivery") == "email"
+                            to_email = filtered_args.get("to_email", "")
+                            for idx, m in enumerate(top_matches, start=1):
+                                size_str = format_size(m.size)
+                                date_str = datetime.fromtimestamp(m.mtime).strftime("%Y-%m-%d")
+                                folder_name = m.path.parent.name
+                                lines.append(f"{idx}. {m.path.name} - {size_str} - {date_str} - in {folder_name}")
+                                kw = {"path": str(m.path.resolve())}
+                                if is_email:
+                                    kw["delivery"] = "email"
+                                    if to_email:
+                                        kw["to_email"] = to_email
+                                choices.append({
+                                    "label": f"{idx}. {m.path.name} ({size_str})",
+                                    "tool": "share_file",
+                                    "kwargs": kw,
+                                })
+                            list_text = "\n".join(lines)
+                            reply_text = f"Found multiple files matching '{raw_target}':\n{list_text}\nTap one to send it."
+                            token = self.choice_store.register(user_id, choices)
+                            labels = [str(c.get("label", "")) for c in choices]
+                            self.history.add(user_id, "user", message)
+                            self.history.add(user_id, "assistant", reply_text)
+                            tot_ms = (time.perf_counter() - t_msg) * 1000.0
+                            log.info("Orchestrator timing | retrieval_ms=0.0 handle_user_message_ms=%.1f", tot_ms)
+                            return ChoicesReply(text=reply_text, token=token, labels=labels)
+
+                        if target_path:
+                            resolved_str = str(target_path.resolve())
+                            filtered_args["path"] = resolved_str
+                            self.last_file_path[user_id] = resolved_str
+                            self.intent_router.update_context(user_id, last_file_path=resolved_str)
+
+                    if routed_plugin and routed_plugin.requires_approval:
+                        self.history.add(user_id, "user", message)
+                        tot_ms = (time.perf_counter() - t_msg) * 1000.0
+                        log.info("Orchestrator timing | retrieval_ms=0.0 handle_user_message_ms=%.1f", tot_ms)
+                        return await self.request_tool_approval(user_id, name, filtered_args)
+
+                    res = await self.run_tool(name, filtered_args, chat_id)
+                    assistant_turn = {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "routed",
+                            "type": "function",
+                            "function": {"name": name, "arguments": filtered_args},
+                        }],
+                    }
+                    tool_turn = {
+                        "role": "tool",
+                        "tool_name": name,
+                        "content": (res.output or "")[:500],
+                    }
+
+                    if isinstance(res.data, dict) and res.data.get("choices"):
+                        choices = res.data["choices"]
+                        if res.data.get("matches"):
+                            top_path = str(res.data["matches"][0])
+                            self.last_file_path[user_id] = top_path
+                            self.intent_router.update_context(user_id, last_file_path=top_path)
+                        token = self.choice_store.register(user_id, choices)
+                        labels = [str(c.get("label", "")) for c in choices]
+                        reply_text = str(res.data.get("direct_reply") or res.output or "")
+                        self.history.add(user_id, "user", message)
+                        self.history.add(user_id, assistant_turn)
+                        self.history.add(user_id, tool_turn)
+                        self.history.add(user_id, "assistant", reply_text)
+                        tot_ms = (time.perf_counter() - t_msg) * 1000.0
+                        log.info("Orchestrator timing | retrieval_ms=0.0 handle_user_message_ms=%.1f", tot_ms)
+                        return ChoicesReply(text=reply_text, token=token, labels=labels)
+
+                    reply_text = str(res.data.get("direct_reply") if isinstance(res.data, dict) and res.data.get("direct_reply") else res.output)
+                    self.history.add(user_id, "user", message)
+                    self.history.add(user_id, assistant_turn)
+                    self.history.add(user_id, tool_turn)
+                    self.history.add(user_id, "assistant", reply_text)
+                    tot_ms = (time.perf_counter() - t_msg) * 1000.0
+                    log.info("Orchestrator timing | retrieval_ms=0.0 handle_user_message_ms=%.1f", tot_ms)
+                    return reply_text
 
             # Split-query retrieval: short follow-ups get two queries for context
             t_ret = time.perf_counter()

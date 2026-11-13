@@ -29,6 +29,24 @@ from typing import Any
 
 
 @dataclasses.dataclass
+class IntentContext:
+    """Context passed to match_intent hooks for deterministic routing."""
+    user_id: int | str = 0
+    last_file_path: str = ""
+    last_query: str = ""
+    timestamps: dict[str, float] = dataclasses.field(default_factory=dict)
+    index_ready: bool = True
+
+
+@dataclasses.dataclass
+class RoutedCall:
+    """A deterministically routed tool call."""
+    tool_name: str
+    kwargs: dict[str, Any]
+    rule: str
+
+
+@dataclasses.dataclass
 class PluginResult:
     """Standardised return value from every plugin.
 
@@ -152,6 +170,12 @@ class PluginBase(abc.ABC):
 
     async def prepare_preview(self, kwargs: dict[str, Any]) -> str | None:
         """Optional hook to build a rich human-readable HITL preview before approval."""
+        return None
+
+    def match_intent(self, message: str, ctx: IntentContext) -> RoutedCall | None:
+        """Optional hook to claim a user message deterministically.
+        Returns a RoutedCall(tool_name, kwargs, rule) or None.
+        """
         return None
 
     # ------------------------------------------------------------------
