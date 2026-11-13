@@ -333,6 +333,29 @@ def _match_candidate(
     return None
 
 
+def get_search_roots() -> list[Path]:
+    """Return configured or priority search roots."""
+    if config.FILE_SEARCH_ROOTS:
+        override_roots: list[Path] = []
+        for r in config.FILE_SEARCH_ROOTS.split(","):
+            r_str = r.strip()
+            if r_str:
+                p = Path(os.path.expandvars(os.path.expanduser(r_str)))
+                if p.exists() and p.is_dir() and not is_sensitive_path(p):
+                    override_roots.append(p.resolve())
+        if override_roots:
+            return override_roots
+
+    home = Path.home()
+    priority_subdirs = ["Desktop", "Downloads", "Documents", "Pictures", "Videos", "Music"]
+    roots: list[Path] = []
+    for d in priority_subdirs:
+        p = home / d
+        if p.exists() and p.is_dir() and not is_sensitive_path(p):
+            roots.append(p)
+    return roots or [home]
+
+
 def search_files(query: str, file_type: str = "", max_results: int = 5) -> list[FileMatch]:
     """Find files or folders matching ``query`` returning list of FileMatch objects."""
     cleaned_query = query.strip().strip('"\'')

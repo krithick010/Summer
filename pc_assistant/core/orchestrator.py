@@ -15,10 +15,12 @@ import logging
 import pkgutil
 import time
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import config
 from config import ASSISTANT_NAME, EXTRACTOR_ENABLED, MEMORY_TOP_K, USER_NAME
+from core.choices import ChoiceStore, choice_store as default_choice_store
 from core.history import History
 from core.llm_engine import LLMEngine
 from core.memory import MemoryManager
@@ -27,6 +29,14 @@ import plugins
 from plugins.base import PluginBase, PluginResult
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class ChoicesReply:
+    text: str
+    token: str
+    labels: list[str]
+
 
 SYSTEM_TEMPLATE = """You are {assistant_name}, {user_name}'s personal assistant running privately on their own PC.
 Talk like a close friend texting: casual, short (1-2 sentences), natural. No corporate phrases, no "As an AI".
@@ -110,10 +120,12 @@ class Orchestrator:
         llm: LLMEngine | None = None,
         state_manager: StateManager | None = None,
         memory: MemoryManager | None = None,
+        choice_store: ChoiceStore | None = None,
     ) -> None:
         self.llm = llm or LLMEngine()
         self.state_manager = state_manager or default_state_manager
         self.memory = memory or MemoryManager()
+        self.choice_store = choice_store or default_choice_store
         self.history = History()
         self.registry: dict[str, PluginBase] = {}
         self._hitl_builder: Callable[..., dict[str, Any]] | None = None
@@ -165,6 +177,39 @@ class Orchestrator:
             if p.name != "save_memory"
         ]
 
+    async def request_tool_approval(
+        self,
+        user_id: int,
+        tool_name: str,
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build HITL approval action and return approval prompt payload."""
+        plugin = self.registry.get(tool_name)
+        if plugin is None:
+            return {"text": f"Unknown tool: {tool_name}"}
+        allowed = plugin.parameters_schema.get("properties", {})
+        filtered_args = {k: v for k, v in kwargs.items() if k in allowed} if allowed else {}
+        try:
+            custom_preview = await plugin.prepare_preview(filtered_args)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("prepare_preview failed for %s: %s", tool_name, exc)
+            custom_preview = None
+        preview = custom_preview or "\n".join(f"• {k}: {v}" for k, v in filtered_args.items())
+        action = self.state_manager.create_action(
+            tool_name=tool_name,
+            kwargs=filtered_args,
+            description=preview,
+            user_id=user_id,
+        )
+        if self._hitl_builder is None:
+            log.error("HITL builder not set — cannot pause for approval.")
+            return {"text": "⚠️ Internal configuration error: HITL builder not registered."}
+        return self._hitl_builder(
+            approval_id=action.approval_id,
+            preview_text=preview,
+            tool_name=tool_name,
+        )
+
     async def run_tool(
         self,
         tool_name: str,
@@ -193,7 +238,7 @@ class Orchestrator:
         self,
         *args: Any,
         **kwargs: Any,
-    ) -> str | dict[str, Any]:
+    ) -> str | dict[str, Any] | ChoicesReply:
         """Process incoming user message through History + RAG + Ollama tool loop."""
         if len(args) == 1:
             user_id, chat_id, message = 0, 0, str(args[0])
@@ -267,30 +312,9 @@ class Orchestrator:
                     filtered_args = {k: v for k, v in call_args.items() if k in allowed} if allowed else {}
 
                     if plugin.requires_approval:
-                        try:
-                            custom_preview = await plugin.prepare_preview(filtered_args)
-                        except Exception as exc:  # noqa: BLE001
-                            log.warning("prepare_preview failed for %s: %s", name, exc)
-                            custom_preview = None
-                        preview = custom_preview or "\n".join(f"• {k}: {v}" for k, v in filtered_args.items())
-                        action = self.state_manager.create_action(
-                            tool_name=name,
-                            kwargs=filtered_args,
-                            description=preview,
-                            user_id=user_id,
-                        )
-                        # Preserve context: record user prompt and assistant tool_calls in history
                         self.history.add(user_id, "user", message)
                         self.history.add(user_id, assistant_turn)
-
-                        if self._hitl_builder is None:
-                            log.error("HITL builder not set — cannot pause for approval.")
-                            return "⚠️ Internal configuration error: HITL builder not registered."
-                        return self._hitl_builder(
-                            approval_id=action.approval_id,
-                            preview_text=preview,
-                            tool_name=name,
-                        )
+                        return await self.request_tool_approval(user_id, name, filtered_args)
 
                     res = await self.run_tool(name, filtered_args, chat_id)
                     msgs.append({"role": "tool", "tool_name": name, "content": res.output})
@@ -299,6 +323,34 @@ class Orchestrator:
                         "tool_name": name,
                         "content": (res.output or "")[:500],
                     })
+
+                    if len(calls) == 1 and isinstance(res.data, dict):
+                        choices = res.data.get("choices")
+                        if choices and isinstance(choices, list):
+                            token = self.choice_store.register(user_id, choices)
+                            labels = [str(c.get("label", "")) for c in choices]
+                            reply_text = str(res.data.get("direct_reply") or res.output or "")
+                            self.history.add(user_id, "user", message)
+                            self.history.add(user_id, assistant_turn)
+                            self.history.add(user_id, {"role": "tool", "tool_name": name, "content": res.output})
+                            self.history.add(user_id, "assistant", reply_text)
+                            if EXTRACTOR_ENABLED:
+                                task = asyncio.create_task(self._remember(hist, message))
+                                self._bg_tasks.add(task)
+                                task.add_done_callback(self._bg_tasks.discard)
+                            return ChoicesReply(text=reply_text, token=token, labels=labels)
+
+                        if "direct_reply" in res.data and res.data["direct_reply"]:
+                            reply_text = str(res.data["direct_reply"])
+                            self.history.add(user_id, "user", message)
+                            self.history.add(user_id, assistant_turn)
+                            self.history.add(user_id, {"role": "tool", "tool_name": name, "content": res.output})
+                            self.history.add(user_id, "assistant", reply_text)
+                            if EXTRACTOR_ENABLED:
+                                task = asyncio.create_task(self._remember(hist, message))
+                                self._bg_tasks.add(task)
+                                task.add_done_callback(self._bg_tasks.discard)
+                            return reply_text
 
                 reply = await self.llm.chat(msgs, tools=tools)
                 log.info("tool_calls=%s", reply.get("tool_calls"))

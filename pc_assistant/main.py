@@ -264,10 +264,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     # ``response`` can be:
-    #   • A plain string  → send directly
+    #   • ChoicesReply → inline keyboard choices + plain text
+    #   • A plain string  → send directly as plain text
     #   • A dict with ``text`` + ``reply_markup`` keys → HITL approval prompt
-    if isinstance(response, str):
-        await _safe_reply_text(update.message, response)
+    from core.orchestrator import ChoicesReply  # noqa: PLC0415
+
+    if isinstance(response, ChoicesReply):
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton(label, callback_data=f"pick:{response.token}:{idx}")]
+                for idx, label in enumerate(response.labels)
+            ]
+        )
+        await update.message.reply_text(
+            text=response.text,
+            reply_markup=keyboard,
+        )
+    elif isinstance(response, str):
+        await update.message.reply_text(text=response)
     elif isinstance(response, dict):
         await _safe_reply_text(
             update.message,
@@ -288,9 +302,47 @@ async def handle_callback_query(
         await query.edit_message_text(_deny_message())
         return
 
-    # Callback data format:  "hitl:<action>:<approval_id>"
-    # e.g.  "hitl:approve:abc123"  or  "hitl:cancel:abc123"
+    # Callback data formats:
+    #   "pick:<token>:<index>" -> user picked a file/choice option
+    #   "hitl:<action>:<approval_id>" -> e.g. "hitl:approve:abc123" or "hitl:cancel:abc123"
     data: str = query.data or ""
+    if data.startswith("pick:"):
+        _, token, idx_str = data.split(":", 2)
+        try:
+            index = int(idx_str)
+        except ValueError:
+            await query.edit_message_text("Invalid selection.")
+            return
+
+        from core.choices import choice_store  # noqa: PLC0415
+
+        choice = choice_store.get(token, user_id, index)
+        if choice is None:
+            await query.edit_message_text("⏰ This choice has expired or is invalid.")
+            return
+
+        tool_name = choice.get("tool", "")
+        kwargs = choice.get("kwargs", {})
+        if not _orchestrator:
+            await query.edit_message_text("Assistant is not ready.")
+            return
+
+        approval_payload = await _orchestrator.request_tool_approval(user_id, tool_name, kwargs)
+        if isinstance(approval_payload, dict) and "reply_markup" in approval_payload:
+            await query.edit_message_text(
+                approval_payload["text"],
+                reply_markup=approval_payload["reply_markup"],
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            txt = (
+                approval_payload.get("text", "Action pending.")
+                if isinstance(approval_payload, dict)
+                else str(approval_payload)
+            )
+            await query.edit_message_text(txt)
+        return
+
     if not data.startswith("hitl:"):
         log.warning("Unexpected callback data: %r", data)
         return
@@ -380,10 +432,23 @@ async def handle_callback_query(
                 # 3. Append tool response message to user history
                 _orchestrator.history.add(user_id, tool_msg)
 
-                # 4. Resume the LLM conversational loop
-                final_text = await _orchestrator.resume_tool_loop(user_id)
+                # 4. Use direct_reply if present, else resume the LLM conversational loop
+                if (
+                    result
+                    and result.success
+                    and isinstance(result.data, dict)
+                    and "direct_reply" in result.data
+                ):
+                    final_text = str(result.data["direct_reply"])
+                    _orchestrator.history.add(user_id, "assistant", final_text)
+                else:
+                    final_text = await _orchestrator.resume_tool_loop(user_id)
             else:
-                final_text = result_output
+                final_text = (
+                    str(result.data["direct_reply"])
+                    if result and isinstance(result.data, dict) and "direct_reply" in result.data
+                    else result_output
+                )
 
             # 5. Send final conversational response
             await _safe_send_message(

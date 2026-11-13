@@ -2910,14 +2910,15 @@ class TestFilesPlugins(unittest.TestCase):
                 res = _run(plugin.execute(query="project brief"))
                 self.assertTrue(res.success)
                 self.assertIn("project_brief.pdf", res.output)
-                self.assertEqual(len(res.data["files"]), 1)
+                self.assertEqual(len(res.data["matches"]), 1)
 
     def test_share_file_plugin_metadata(self):
         from plugins.p_files import ShareFilePlugin
         plugin = ShareFilePlugin()
         self.assertEqual(plugin.name, "share_file")
         self.assertTrue(plugin.requires_approval)
-        self.assertIn("query", plugin.parameters_schema["required"])
+        self.assertIn("path", plugin.parameters_schema["required"])
+        self.assertNotIn("query", plugin.parameters_schema.get("properties", {}))
 
     def test_share_file_prepare_preview(self):
         import config
@@ -3008,7 +3009,7 @@ class TestFilesPlugins(unittest.TestCase):
                     self.assertEqual(mock_gmail.execute.call_args.kwargs["to_email"], "partner@example.com")
                     self.assertIn("contract.pdf", mock_gmail.execute.call_args.kwargs["attachment_path"])
 
-    def test_share_file_auto_email_route_15_to_25mb(self):
+    def test_share_file_default_route_telegram_for_20mb(self):
         import config
         from plugins.p_files import ShareFilePlugin
         from plugins.base import PluginResult
@@ -3025,7 +3026,29 @@ class TestFilesPlugins(unittest.TestCase):
                 with patch.object(config, "FILE_SEARCH_ROOTS", td):
                     with patch.object(config, "USER_DEFAULT_EMAIL", "default@example.com"):
                         with patch("os.path.getsize", return_value=20 * 1024 * 1024):
-                            res = _run(plugin.execute(query="heavy_report.pdf", delivery="auto"))
+                            res = _run(plugin.execute(path=str(doc)))
+                            self.assertTrue(res.success)
+                            self.assertEqual(len(res.data["send_files"]), 1)
+                            mock_gmail.execute.assert_not_called()
+
+    def test_share_file_email_only_when_asked(self):
+        import config
+        from plugins.p_files import ShareFilePlugin
+        from plugins.base import PluginResult
+        plugin = ShareFilePlugin()
+        with tempfile.TemporaryDirectory() as td:
+            doc = Path(td) / "heavy_report.pdf"
+            doc.write_bytes(b"0" * 100)
+
+            mock_gmail = MagicMock()
+            mock_gmail.is_available.return_value = True
+            mock_gmail.execute = AsyncMock(return_value=PluginResult(success=True, output="Email sent!"))
+
+            with patch("plugins.p_gmail.GmailPlugin", return_value=mock_gmail):
+                with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                    with patch.object(config, "USER_DEFAULT_EMAIL", "default@example.com"):
+                        with patch("os.path.getsize", return_value=20 * 1024 * 1024):
+                            res = _run(plugin.execute(path=str(doc), delivery="email"))
                             self.assertTrue(res.success)
                             mock_gmail.execute.assert_awaited_once()
 
@@ -3188,6 +3211,159 @@ class TestTelegramCallbackFileDelivery(unittest.TestCase):
             # Verified photo (cleanup=False) remains, while temp_zip (cleanup=True) was deleted
             self.assertTrue(photo_file.exists())
             self.assertFalse(temp_zip.exists())
+
+
+class TestPhase2DeterministicFileTools(unittest.TestCase):
+    """Hermetic unit tests for Phase 2 deterministic file tools, buttons, and direct replies."""
+
+    def test_choices_roundtrip(self):
+        from core.choices import ChoiceStore
+        cs = ChoiceStore()
+        choices = [
+            {"label": "1. Report.pdf (1.2 MB)", "tool": "share_file", "kwargs": {"path": "/fake/report.pdf"}},
+            {"label": "2. Notes.txt (0.1 MB)", "tool": "share_file", "kwargs": {"path": "/fake/notes.txt"}},
+        ]
+        token = cs.register(user_id=123, choices=choices, ttl=300)
+        self.assertIsInstance(token, str)
+        c0 = cs.get(token, user_id=123, index=0)
+        self.assertIsNotNone(c0)
+        self.assertEqual(c0["kwargs"]["path"], "/fake/report.pdf")
+        c1 = cs.get(token, user_id=123, index=1)
+        self.assertIsNotNone(c1)
+        self.assertEqual(c1["kwargs"]["path"], "/fake/notes.txt")
+
+    def test_choices_expired_or_foreign_token_rejected(self):
+        from core.choices import ChoiceStore
+        cs = ChoiceStore()
+        token = cs.register(user_id=100, choices=[{"label": "A", "tool": "foo", "kwargs": {}}], ttl=-1)
+        # Expired
+        self.assertIsNone(cs.get(token, user_id=100, index=0))
+
+        # Foreign user
+        token2 = cs.register(user_id=100, choices=[{"label": "A", "tool": "foo", "kwargs": {}}], ttl=300)
+        self.assertIsNone(cs.get(token2, user_id=999, index=0))
+
+        # Bad index
+        self.assertIsNone(cs.get(token2, user_id=100, index=5))
+        self.assertIsNone(cs.get(token2, user_id=100, index=-1))
+
+    def test_find_files_schema_has_only_query(self):
+        from plugins.p_files import FindFilesPlugin
+        p = FindFilesPlugin()
+        self.assertEqual(list(p.parameters_schema["properties"].keys()), ["query"])
+        self.assertEqual(p.parameters_schema["required"], ["query"])
+
+    def test_share_file_schema_has_path_required(self):
+        from plugins.p_files import ShareFilePlugin
+        p = ShareFilePlugin()
+        self.assertEqual(p.parameters_schema["required"], ["path"])
+        self.assertNotIn("query", p.parameters_schema["properties"])
+
+    def test_orchestrator_returns_choices_reply(self):
+        from core.orchestrator import ChoicesReply, Orchestrator
+        from plugins.base import PluginResult
+        orch = Orchestrator(llm=MagicMock())
+        fake_result = PluginResult(
+            success=True,
+            output="Found files",
+            data={
+                "direct_reply": "1. Report.pdf (1.2 MB)\nTap one to send it.",
+                "choices": [{"label": "1. Report.pdf (1.2 MB)", "tool": "share_file", "kwargs": {"path": "/fake/path.pdf"}}],
+            },
+        )
+        fake_plugin = MagicMock()
+        fake_plugin.name = "find_files"
+        fake_plugin.requires_approval = False
+        fake_plugin.parameters_schema = {"type": "object", "properties": {"query": {"type": "string"}}}
+        fake_plugin.execute = AsyncMock(return_value=fake_result)
+        orch.registry = {"find_files": fake_plugin}
+
+        orch.llm.chat = AsyncMock(return_value={
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"function": {"name": "find_files", "arguments": {"query": "report"}}}],
+        })
+
+        reply = _run(orch.handle_user_message(user_id=1, chat_id=1, message="find report"))
+        self.assertIsInstance(reply, ChoicesReply)
+        self.assertIn("Tap one to send it.", reply.text)
+        self.assertEqual(len(reply.labels), 1)
+        self.assertIn("1. Report.pdf", reply.labels[0])
+        # Checked choice registered in choice_store
+        stored = orch.choice_store.get(reply.token, user_id=1, index=0)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored["kwargs"]["path"], "/fake/path.pdf")
+
+    def test_direct_reply_skips_second_model_call_and_lands_in_history(self):
+        from core.orchestrator import Orchestrator
+        from plugins.base import PluginResult
+        orch = Orchestrator(llm=MagicMock())
+        fake_result = PluginResult(
+            success=True,
+            output="Searched",
+            data={"direct_reply": "No match for 'xyz'. Looked in: Downloads."},
+        )
+        fake_plugin = MagicMock()
+        fake_plugin.name = "find_files"
+        fake_plugin.requires_approval = False
+        fake_plugin.parameters_schema = {"type": "object", "properties": {"query": {"type": "string"}}}
+        fake_plugin.execute = AsyncMock(return_value=fake_result)
+        orch.registry = {"find_files": fake_plugin}
+
+        orch.llm.chat = AsyncMock(return_value={
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"function": {"name": "find_files", "arguments": {"query": "xyz"}}}],
+        })
+
+        reply = _run(orch.handle_user_message(user_id=1, chat_id=1, message="find xyz"))
+        self.assertEqual(reply, "No match for 'xyz'. Looked in: Downloads.")
+        # Only one chat call made, follow-up call skipped!
+        orch.llm.chat.assert_awaited_once()
+
+        # Check history contains user, assistant tool_call, tool result, and assistant direct_reply
+        hist = orch.history.get(1)
+        self.assertEqual(hist[-1]["role"], "assistant")
+        self.assertEqual(hist[-1]["content"], "No match for 'xyz'. Looked in: Downloads.")
+
+    def test_pick_callback_to_approval_card_with_exact_path(self):
+        import main
+        from core.choices import choice_store
+        token = choice_store.register(
+            user_id=42,
+            choices=[{"label": "1. Report.pdf", "tool": "share_file", "kwargs": {"path": "/exact/path/report.pdf"}}],
+        )
+
+        mock_query = MagicMock()
+        mock_query.from_user.id = 42
+        mock_query.data = f"pick:{token}:0"
+        mock_query.answer = AsyncMock()
+        mock_query.edit_message_text = AsyncMock()
+
+        mock_update = MagicMock()
+        mock_update.callback_query = mock_query
+
+        mock_orch = MagicMock()
+        mock_orch.request_tool_approval = AsyncMock(return_value={
+            "text": "Action requires approval for /exact/path/report.pdf",
+            "reply_markup": MagicMock(),
+        })
+
+        with patch.object(main, "_orchestrator", mock_orch):
+            with patch.object(main, "_is_allowed", return_value=True):
+                _run(main.handle_callback_query(mock_update, MagicMock()))
+
+        mock_orch.request_tool_approval.assert_awaited_once_with(42, "share_file", {"path": "/exact/path/report.pdf"})
+        mock_query.edit_message_text.assert_awaited_once()
+        call_kwargs = mock_query.edit_message_text.call_args[0]
+        self.assertIn("/exact/path/report.pdf", call_kwargs[0])
+
+    def test_orchestrator_file_has_no_telegram_import(self):
+        orch_path = Path(__file__).resolve().parent.parent / "core" / "orchestrator.py"
+        with open(orch_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("import ") or line.startswith("from "):
+                    self.assertNotIn("telegram", line, f"Orchestrator must not import telegram: {line}")
 
 
 if __name__ == "__main__":

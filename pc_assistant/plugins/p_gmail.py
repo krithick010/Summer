@@ -181,16 +181,6 @@ class GmailPlugin(PluginBase):
         body: str,
         attachment_path: str | None = None,
     ) -> PluginResult:
-        service = self._get_service()
-
-        msg = EmailMessage()
-        msg.set_content(body)
-        msg["To"] = to_email
-        msg["Subject"] = subject
-        # From header is required by Gmail API
-        if GMAIL_SENDER_EMAIL:
-            msg["From"] = GMAIL_SENDER_EMAIL
-
         if attachment_path:
             import mimetypes
             import os
@@ -209,6 +199,18 @@ class GmailPlugin(PluginBase):
                     output=f"⚠️ Attachment '{att.name}' is {size_mb:.1f} MB (Gmail attachment limit is 25 MB).",
                     error="Attachment exceeds Gmail 25 MB limit",
                 )
+
+        service = self._get_service()
+
+        msg = EmailMessage()
+        msg.set_content(body)
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        # From header is required by Gmail API
+        if GMAIL_SENDER_EMAIL:
+            msg["From"] = GMAIL_SENDER_EMAIL
+
+        if attachment_path:
             ctype, encoding = mimetypes.guess_type(str(att))
             if ctype is None or encoding is not None:
                 ctype = "application/octet-stream"

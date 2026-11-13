@@ -83,3 +83,13 @@ Read-only web plugins (`get_weather`, `get_ai_news`, `search_wikipedia`) use a r
 - **Multi-Source AI News (`AI_NEWS_URLS`)**: `get_ai_news` tries each comma-separated URL in `AI_NEWS_URLS` in order until one yields at least 3 clean headlines. Because live web pages change over time, you can swap or reorder `AI_NEWS_URLS` in `.env` anytime without touching code.
 - **Debug Screenshots (`data/debug/`)**: When a web lookup fails (timeout, HTTP `>= 400`, CAPTCHA redirect, empty page, or missing headlines), a screenshot is saved under `data/debug/` (the newest 10 files are kept; `data/` is git-ignored) and logged for inspection.
 
+---
+
+## 5. Generic `PluginResult.data` Keys
+
+Plugins can pass structured instructions back to the orchestrator and UI via the `PluginResult.data` dictionary:
+
+- **`direct_reply`** (`str`): If a turn's only tool call returns this, the orchestrator uses it verbatim as the reply, records it as the assistant message in history, and does **NOT** make the follow-up model call.
+- **`choices`** (`list[dict]`): A list of interactive options structured as `[{"label": str, "tool": str, "kwargs": dict}]`. When present, the orchestrator registers them with `ChoiceStore` and returns a `ChoicesReply`, rendered in Telegram as an inline keyboard. Tapping an option triggers the corresponding tool (or its HITL approval flow if required).
+
+

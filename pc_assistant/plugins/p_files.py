@@ -18,7 +18,9 @@ from plugins.base import PluginBase, PluginResult
 from plugins.file_search import (
     compress_to_zip,
     find_files,
+    get_search_roots,
     is_sensitive_path,
+    search_files,
     split_file_chunks,
 )
 
@@ -41,17 +43,13 @@ class FindFilesPlugin(PluginBase):
     description = (
         "Searches for files or folders on the local PC matching a name, keywords, or path."
     )
-    usage_hint = "when they ask to search, find, or locate a file or folder on the PC"
+    usage_hint = "when they ask to find, locate or send a file or folder (always search first)"
     parameters_schema = {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
                 "description": "Name, keywords, or path of the file or folder to find",
-            },
-            "file_type": {
-                "type": "string",
-                "description": "Optional file extension filter (e.g. 'pdf', 'png')",
             },
         },
         "required": ["query"],
@@ -60,7 +58,6 @@ class FindFilesPlugin(PluginBase):
 
     async def execute(self, **kwargs: Any) -> PluginResult:
         query = str(kwargs.get("query", "")).strip()
-        file_type = str(kwargs.get("file_type", "")).strip()
 
         if not query:
             return PluginResult(
@@ -69,29 +66,42 @@ class FindFilesPlugin(PluginBase):
                 error="Missing required query parameter",
             )
 
-        matches = await asyncio.to_thread(find_files, query, file_type=file_type)
+        matches = await asyncio.to_thread(search_files, query)
         if not matches:
+            roots = get_search_roots()
+            folders = ", ".join(p.name or str(p) for p in roots)
+            no_match_msg = f"No match for '{query}'. Looked in: {folders}."
             return PluginResult(
-                success=True,
-                output=f"No files or folders found matching '{query}'.",
-                data={"query": query, "files": []},
+                success=False,
+                output=no_match_msg,
+                data={"direct_reply": no_match_msg, "matches": []},
             )
 
-        lines = [f"Found {len(matches)} matching file(s):"]
-        for idx, path in enumerate(matches, start=1):
-            try:
-                st = path.stat()
-                size_str = _format_size(st.st_size)
-                mtime_str = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
-                item_type = "folder" if path.is_dir() else "file"
-                lines.append(f"{idx}. {path.name} ({size_str}, {item_type}) - `{path}` [Modified: {mtime_str}]")
-            except Exception:
-                lines.append(f"{idx}. {path.name} - `{path}`")
+        top_matches = matches[:5]
+        lines = []
+        choices = []
+        for idx, m in enumerate(top_matches, start=1):
+            size_mb = m.size / (1024 * 1024)
+            size_str = f"{size_mb:.1f} MB"
+            date_str = datetime.fromtimestamp(m.mtime).strftime("%Y-%m-%d")
+            folder_name = m.path.parent.name
+            lines.append(f"{idx}. {m.path.name} - {size_str} - {date_str} - in {folder_name}")
+            choices.append({
+                "label": f"{idx}. {m.path.name} ({size_str})",
+                "tool": "share_file",
+                "kwargs": {"path": str(m.path.resolve())},
+            })
 
+        list_text = "\n".join(lines)
+        direct_reply = f"{list_text}\nTap one to send it."
         return PluginResult(
             success=True,
-            output="\n".join(lines),
-            data={"query": query, "files": [str(p) for p in matches]},
+            output=direct_reply,
+            data={
+                "matches": [str(m.path.resolve()) for m in top_matches],
+                "direct_reply": direct_reply,
+                "choices": choices,
+            },
         )
 
 
@@ -102,99 +112,103 @@ class ShareFilePlugin(PluginBase):
     description = (
         "Finds, prepares, and shares a local file or folder via Telegram or email."
     )
-    usage_hint = "when they ask to send, share, or email a file or folder"
+    usage_hint = "only with an exact path from find_files or typed by the user"
     parameters_schema = {
         "type": "object",
         "properties": {
-            "query": {
+            "path": {
                 "type": "string",
-                "description": "Exact/partial path or blunt/fuzzy name of the file or folder to send",
+                "description": "Absolute path of the file or folder to share",
             },
             "delivery": {
                 "type": "string",
-                "enum": ["auto", "telegram", "email"],
-                "description": "Delivery channel: 'auto' (default), 'telegram', or 'email'",
+                "enum": ["telegram", "email"],
+                "description": "Delivery channel: 'telegram' (default) or 'email'",
             },
             "to_email": {
                 "type": "string",
                 "description": "Optional recipient email address when delivery is email",
             },
         },
-        "required": ["query"],
+        "required": ["path"],
     }
     requires_approval = True
 
     async def prepare_preview(self, kwargs: dict[str, Any]) -> str | None:
-        """Resolve top matching file and build a rich HITL approval preview."""
-        query = str(kwargs.get("query", "")).strip()
-        delivery = str(kwargs.get("delivery", "auto")).lower()
-        if not query:
+        """Resolve target file and build a rich HITL approval preview."""
+        path_str = str(kwargs.get("path") or kwargs.get("query") or "").strip()
+        delivery = str(kwargs.get("delivery", "telegram")).lower()
+        is_email = (delivery == "email") or ("email" in delivery) or ("mail" in delivery)
+        route_str = "Email" if is_email else "Telegram"
+
+        if not path_str:
             return None
 
-        matches = await asyncio.to_thread(find_files, query)
-        if not matches:
-            return f"• File: No matching file found for '{query}'\n• Action: Search will report not found"
+        target = Path(path_str)
+        if not target.is_absolute() and not target.exists():
+            matches = await asyncio.to_thread(find_files, path_str)
+            if matches:
+                target = matches[0]
 
-        target = matches[0]
         if is_sensitive_path(target):
-            return f"• File: {target}\n• Security: Blocked (sensitive file)"
+            return f"• Path: {target}\n• File: {target.name}\n• Security: Blocked (sensitive file)"
+
+        if not target.exists():
+            return f"• Path: {target}\n• File: {target.name}\n• Status: File not found"
 
         try:
             if target.is_dir():
                 size_bytes = sum(f.stat().st_size for f in target.rglob("*") if f.is_file())
-                size_mb = size_bytes / (1024 * 1024)
-                action = "Auto-Zip & Send via Telegram" if delivery != "email" else "Auto-Zip & Email"
             else:
-                size_mb = target.stat().st_size / (1024 * 1024)
-                if delivery == "email":
-                    action = "Email Attachment" if size_mb <= 25.0 else "Auto-Zip & Email"
-                elif delivery == "auto" and config.FILE_TELEGRAM_MAX_MB < size_mb <= 25.0:
-                    action = "Email Attachment (Gmail)"
-                elif size_mb <= 50.0:
-                    action = "Send via Telegram"
-                elif size_mb <= config.FILE_MAX_SPLIT_MB:
-                    action = "Auto-Zip & Split via Telegram"
-                else:
-                    action = "Too Large (exceeds limit)"
+                size_bytes = target.stat().st_size
+            size_mb = size_bytes / (1024 * 1024)
         except Exception:
             size_mb = 0.0
-            action = "Send via Telegram"
 
-        return f"• File: {target}\n• Size: {size_mb:.2f} MB\n• Action: {action}"
+        return (
+            f"• File: {target.name}\n"
+            f"• Path: {target.resolve()}\n"
+            f"• Size: {size_mb:.1f} MB\n"
+            f"• Route: {route_str}\n"
+            f"• Action: Send via {route_str}"
+        )
 
     async def execute(self, **kwargs: Any) -> PluginResult:
-        query = str(kwargs.get("query", "")).strip()
-        delivery = str(kwargs.get("delivery", "auto")).lower()
+        path_str = str(kwargs.get("path") or kwargs.get("query") or "").strip()
+        delivery = str(kwargs.get("delivery", "telegram")).lower()
         to_email = str(kwargs.get("to_email", "")).strip()
 
-        if not query:
+        if not path_str:
             return PluginResult(
                 success=False,
-                output="⚠️ Please specify the file or folder to share.",
-                error="Missing required query parameter",
+                output="⚠️ Please specify the file or folder path to share.",
+                error="Missing required path parameter",
             )
 
-        matches = await asyncio.to_thread(find_files, query)
-        if not matches:
-            return PluginResult(
-                success=False,
-                output=f"Could not find any file or folder matching '{query}'.",
-                error=f"File not found for query '{query}'",
-            )
-
-        target = matches[0]
-        if is_sensitive_path(target):
-            return PluginResult(
-                success=False,
-                output=f"⚠️ Access denied: '{target.name}' is a protected or sensitive file.",
-                error="Sensitive file access blocked",
-            )
+        target = Path(path_str)
+        if not target.is_absolute() and not target.exists():
+            matches = await asyncio.to_thread(find_files, path_str)
+            if matches:
+                target = matches[0]
+            else:
+                return PluginResult(
+                    success=False,
+                    output=f"Could not find any file or folder for '{path_str}'.",
+                    error=f"File not found: {path_str}",
+                )
 
         if not target.exists():
             return PluginResult(
                 success=False,
                 output=f"⚠️ Target path does not exist: `{target}`",
                 error=f"Target path not found: {target}",
+            )
+
+        if is_sensitive_path(target):
+            return PluginResult(
+                success=False,
+                output=f"⚠️ Access denied: '{target.name}' is a protected or sensitive file.",
+                error="Sensitive file access blocked",
             )
 
         tmp_shares_dir = Path(config.DATA_DIR) / "tmp_shares"
@@ -229,20 +243,12 @@ class ShareFilePlugin(PluginBase):
                 error=str(exc),
             )
 
-        # Determine if email routing should be used
-        from plugins.p_gmail import GmailPlugin
-        gmail_plugin = GmailPlugin()
-        gmail_available = gmail_plugin.is_available()
+        is_email = (delivery == "email") or ("email" in delivery) or ("mail" in delivery)
 
-        resolved_recipient = to_email or config.USER_DEFAULT_EMAIL or config.GMAIL_SENDER_EMAIL
-
-        should_email = False
-        if delivery == "email":
-            should_email = True
-        elif delivery == "auto" and (config.FILE_TELEGRAM_MAX_MB < size_mb <= 25.0) and gmail_available and resolved_recipient:
-            should_email = True
-
-        if should_email:
+        if is_email:
+            from plugins.p_gmail import GmailPlugin
+            gmail_plugin = GmailPlugin()
+            resolved_recipient = to_email or config.USER_DEFAULT_EMAIL or config.GMAIL_SENDER_EMAIL
             if not resolved_recipient:
                 if is_temp_zip:
                     send_path.unlink(missing_ok=True)
@@ -252,7 +258,6 @@ class ShareFilePlugin(PluginBase):
                     error="Missing recipient email",
                 )
 
-            # If file > 25 MB and not zipped, attempt compression
             if size_mb > 25.0 and not is_temp_zip:
                 try:
                     send_path = compress_to_zip(send_path, tmp_shares_dir)
@@ -284,37 +289,28 @@ class ShareFilePlugin(PluginBase):
                     body=f"Sending requested file: {target.name} ({size_mb:.2f} MB)",
                     attachment_path=str(send_path),
                 )
+                direct_reply = f"Sent: {target.name} ({size_mb:.1f} MB) via Email."
+                res.data = {"direct_reply": direct_reply}
+                res.output = direct_reply
                 return res
             finally:
                 if is_temp_zip:
                     send_path.unlink(missing_ok=True)
 
-        # Telegram delivery routes
-        # If file > 50 MB and not zipped yet, compress first
-        if size_mb > 50.0 and not is_temp_zip:
-            try:
-                send_path = compress_to_zip(send_path, tmp_shares_dir)
-                is_temp_zip = True
-                size_mb = os.path.getsize(str(send_path)) / (1024 * 1024)
-            except Exception as exc:
-                return PluginResult(
-                    success=False,
-                    output=f"⚠️ Failed to compress '{send_path.name}': {exc}",
-                    error=str(exc),
-                )
-
-        # Telegram single file (<= 50 MB)
-        if size_mb <= 50.0:
+        # Telegram delivery route (default up to FILE_TELEGRAM_MAX_MB, default 50 MB)
+        if size_mb <= config.FILE_TELEGRAM_MAX_MB:
             is_photo = (
                 send_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
                 and size_mb <= 10.0
                 and not is_temp_zip
             )
             kind = "photo" if is_photo else "document"
+            direct_reply = f"Sent: {send_path.name} ({size_mb:.1f} MB) via Telegram."
             return PluginResult(
                 success=True,
-                output=f"Sending '{send_path.name}' ({size_mb:.2f} MB) via Telegram.",
+                output=direct_reply,
                 data={
+                    "direct_reply": direct_reply,
                     "send_files": [
                         {
                             "path": str(send_path),
@@ -322,7 +318,7 @@ class ShareFilePlugin(PluginBase):
                             "kind": kind,
                             "cleanup": is_temp_zip,
                         }
-                    ]
+                    ],
                 },
             )
 
@@ -348,13 +344,11 @@ class ShareFilePlugin(PluginBase):
                 }
                 for part in parts
             ]
+            direct_reply = f"Sent: {send_path.name} ({size_mb:.1f} MB) in {len(parts)} parts via Telegram."
             return PluginResult(
                 success=True,
-                output=(
-                    f"'{target.name}' is {size_mb:.1f} MB (exceeds Telegram 50 MB single-file limit). "
-                    f"Compressed and split into {len(parts)} parts for delivery."
-                ),
-                data={"send_files": send_files},
+                output=direct_reply,
+                data={"direct_reply": direct_reply, "send_files": send_files},
             )
 
         # Exceeds maximum split limit
@@ -369,4 +363,3 @@ class ShareFilePlugin(PluginBase):
             ),
             error=f"File exceeds maximum split limit of {config.FILE_MAX_SPLIT_MB} MB",
         )
-
