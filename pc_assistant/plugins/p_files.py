@@ -19,8 +19,11 @@ from plugins.base import PluginBase, PluginResult
 from plugins.file_search import (
     ALREADY_COMPRESSED_EXTENSIONS,
     check_and_increment_share_limit,
+    check_denylist_rejection,
     compress_to_zip,
     find_files,
+    format_miss_reply,
+    format_size,
     get_search_roots,
     is_outside_usual_folders,
     is_sensitive_path,
@@ -35,12 +38,8 @@ log = logging.getLogger(__name__)
 
 
 def _format_size(size_bytes: int) -> str:
-    """Format bytes into human-readable B, KB, or MB."""
-    if size_bytes < 1024:
-        return f"{size_bytes} B"
-    if size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.1f} KB"
-    return f"{size_bytes / (1024 * 1024):.2f} MB"
+    """Format bytes into human-readable size string."""
+    return format_size(size_bytes)
 
 
 class FindFilesPlugin(PluginBase):
@@ -73,14 +72,21 @@ class FindFilesPlugin(PluginBase):
                 error="Missing required query parameter",
             )
 
+        # Denylist early rejection
+        denial = check_denylist_rejection(query)
+        if denial:
+            return PluginResult(
+                success=False,
+                output=denial,
+                data={"direct_reply": denial, "matches": []},
+            )
+
         matches = await asyncio.to_thread(search_files, query)
         from plugins.file_index import file_indexer  # noqa: PLC0415
         is_building = not file_indexer.is_ready()
 
         if not matches:
-            roots = get_search_roots()
-            folders = ", ".join(p.name or str(p) for p in roots)
-            no_match_msg = f"No match for '{query}'. Looked in: {folders}."
+            no_match_msg = format_miss_reply(query)
             if is_building:
                 no_match_msg = f"Index is building, showing quick search results...\n{no_match_msg}"
             return PluginResult(
@@ -93,8 +99,7 @@ class FindFilesPlugin(PluginBase):
         lines = []
         choices = []
         for idx, m in enumerate(top_matches, start=1):
-            size_mb = m.size / (1024 * 1024)
-            size_str = f"{size_mb:.1f} MB"
+            size_str = format_size(m.size)
             date_str = datetime.fromtimestamp(m.mtime).strftime("%Y-%m-%d")
             folder_name = m.path.parent.name
             lines.append(f"{idx}. {m.path.name} - {size_str} - {date_str} - in {folder_name}")
@@ -174,14 +179,13 @@ class ShareFilePlugin(PluginBase):
                 size_bytes = sum(f.stat().st_size for f in target.rglob("*") if f.is_file())
             else:
                 size_bytes = target.stat().st_size
-            size_mb = size_bytes / (1024 * 1024)
         except Exception:
-            size_mb = 0.0
+            size_bytes = 0
 
         preview_lines = [
             f"• File: {target.name}",
             f"• Path: {target.resolve()}",
-            f"• Size: {size_mb:.1f} MB",
+            f"• Size: {format_size(size_bytes)}",
             f"• Route: {route_str}",
             f"• Action: Send via {route_str}",
         ]
@@ -222,8 +226,7 @@ class ShareFilePlugin(PluginBase):
                 choices = []
                 is_email = (delivery == "email") or ("email" in delivery) or ("mail" in delivery)
                 for idx, m in enumerate(top_matches, start=1):
-                    size_mb = m.size / (1024 * 1024)
-                    size_str = f"{size_mb:.1f} MB"
+                    size_str = format_size(m.size)
                     date_str = datetime.fromtimestamp(m.mtime).strftime("%Y-%m-%d")
                     folder_name = m.path.parent.name
                     lines.append(f"{idx}. {m.path.name} - {size_str} - {date_str} - in {folder_name}")

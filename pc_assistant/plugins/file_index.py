@@ -105,6 +105,7 @@ class FileIndexer:
             "permission_error": 0,
         }
         self.top_folders: list[tuple[str, int]] = []
+        self._vocab: set[str] = set()
 
         self._stop_event = threading.Event()
         self._crawler_thread: threading.Thread | None = None
@@ -414,6 +415,18 @@ class FileIndexer:
                     conn.execute("REPLACE INTO meta (key, value) VALUES ('skip_counts', ?);", (json.dumps(self.skip_counts),))
                     conn.execute("REPLACE INTO meta (key, value) VALUES ('top_folders', ?);", (json.dumps(self.top_folders),))
                     conn.commit()
+
+                    # Refresh in-memory vocab
+                    rows = conn.execute("SELECT DISTINCT name_norm FROM files").fetchall()
+                    vocab = set()
+                    for r in rows:
+                        if r[0]:
+                            for w in r[0].split():
+                                w_clean = re.sub(r"[^\w]", "", w.lower())
+                                if len(w_clean) >= 3:
+                                    vocab.add(w_clean)
+                    with self._lock:
+                        self._vocab = vocab
                 except Exception as meta_exc:
                     log.warning("Failed saving crawl metadata: %s", meta_exc)
 
@@ -542,6 +555,31 @@ class FileIndexer:
 
         scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
         return [m for _, _, m in scored[:max_results]]
+
+    def get_vocabulary(self) -> set[str]:
+        """Return in-memory vocabulary of stem words from the index."""
+        with self._lock:
+            if self._vocab:
+                return set(self._vocab)
+
+        conn = self._get_connection()
+        try:
+            rows = conn.execute("SELECT DISTINCT name_norm FROM files").fetchall()
+            vocab = set()
+            for r in rows:
+                if r[0]:
+                    for w in r[0].split():
+                        w_clean = re.sub(r"[^\w]", "", w.lower())
+                        if len(w_clean) >= 3:
+                            vocab.add(w_clean)
+            with self._lock:
+                self._vocab = vocab
+            return set(vocab)
+        except Exception as exc:
+            log.warning("Error loading vocabulary: %s", exc)
+            return set()
+        finally:
+            conn.close()
 
     def reindex(self) -> None:
         """Trigger a background crawl immediately."""

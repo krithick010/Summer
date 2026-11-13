@@ -10,6 +10,7 @@ so Orchestrator ignores it during plugin auto-discovery.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import difflib
 import logging
 import math
 import os
@@ -163,12 +164,76 @@ NUMERAL_MAP: dict[str, str] = {
 }
 
 
+@dataclass
+class ParsedQuery:
+    tokens: list[str]
+    ext_filter: list[str]
+    want_dir: bool
+    location_terms: list[str]
+    corrections: dict[str, str]
+    raw: str
+
+    def __iter__(self):
+        return iter((self.tokens, self.ext_filter, self.location_terms))
+
+
 @dataclass(frozen=True)
 class FileMatch:
     path: Path
     size: int
     mtime: float
     approximate: bool = False
+
+
+DENYLIST_KEYWORDS: tuple[str, ...] = (
+    "password", "passwords", "passwd", "shadow", ".env", "id_rsa", "id_ed25519",
+    "wallet.dat", "secret_key", "keystore",
+)
+
+
+def check_denylist_rejection(query: str) -> str | None:
+    """Return denial message if query matches any denylist keyword, else None."""
+    q_lower = query.lower()
+    for kw in DENYLIST_KEYWORDS:
+        if kw in q_lower:
+            return f"I cannot share protected or sensitive files ({kw})."
+    return None
+
+
+def format_size(size_bytes: int) -> str:
+    """Format bytes into human-readable B, KB, MB, or GB string.
+
+    < 1024 -> "{n} B"
+    < 1 MB -> "{n/1024:.1f} KB"
+    < 1 GB -> "{n/1024/1024:.1f} MB"
+    >= 1 GB -> "{n/1024/1024/1024:.2f} GB"
+    Never show "0.0 MB" for a small file.
+    """
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    if size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+
+def format_miss_reply(clean_query: str) -> str:
+    """Format honest plain-text message when file search yields 0 results."""
+    from plugins.file_index import file_indexer  # noqa: PLC0415
+    status = file_indexer.get_status()
+    count = status.get("total_indexed", 0)
+    roots = roots_for_mode()
+    roots_str = ", ".join(r.name or str(r) for r in roots) if roots else "configured roots"
+
+    vocab = file_indexer.get_vocabulary()
+    closest = difflib.get_close_matches(clean_query.lower(), vocab, n=3, cutoff=0.4) if vocab else []
+    if closest:
+        return (
+            f"No matching files found for '{clean_query}' (searched {count:,} indexed files across {roots_str}).\n"
+            f"Closest names: {', '.join(closest)}."
+        )
+    return f"No matching files found for '{clean_query}' (searched {count:,} indexed files across {roots_str})."
 
 
 def is_sensitive_path(path: Path | str) -> bool:
@@ -647,88 +712,181 @@ def split_stem_tokens(stem: str) -> list[str]:
     return tokens
 
 
-def parse_query(q: str) -> tuple[list[str], list[str], Path | None]:
-    """Parse query into (name_tokens, ext_filter, root_hint).
+CANONICAL_VOCAB: list[str] = [
+    "folder", "directory", "dir",
+    "send", "sent", "share", "give", "get", "find", "show", "search",
+    "file", "files", "document", "image", "picture", "photo", "video", "movie",
+    "pdf", "word", "docx", "doc", "excel", "sheet", "spreadsheet", "xlsx", "xls",
+    "powerpoint", "slides", "presentation", "pptx", "ppt", "archive", "zip",
+    "music", "audio", "song", "text", "txt",
+]
 
-    - Strips quotes and punctuation, treating / and \\ as separators.
-    - Drops filler tokens.
-    - Converts type words or explicit .ext into ext_filter list.
-    - Identifies location words (e.g. desktop, downloads) as root_hint.
-    - Normalizes numerals (ii->2, two->2).
-    """
-    raw = q.strip().strip('"\'')
-    if not raw:
-        return [], [], None
+COMMON_EXTS: list[str] = [
+    "txt", "pdf", "docx", "doc", "xlsx", "xls", "pptx", "ppt",
+    "png", "jpg", "jpeg", "zip", "mp4", "mp3", "csv", "json", "py",
+]
 
-    root_hint: Path | None = None
+STANDALONE_ALIASES: set[str] = {
+    "desktop", "downloads", "documents", "pictures", "videos", "music", "onedrive",
+}
+
+DIR_WORDS: set[str] = {"folder", "directory", "dir"}
+
+
+def _path_matches_location(path: Path, location_terms: list[str]) -> bool:
+    """Return True if path's folder components match location_terms IN ORDER (exact or word-prefix)."""
+    if not location_terms:
+        return True
+
+    parent_folders = [p.name.lower() for p in reversed(path.parents) if p.name]
+    if path.is_dir() and path.name:
+        parent_folders.append(path.name.lower())
+
+    term_idx = 0
+    total_terms = len(location_terms)
+
+    for folder in parent_folders:
+        folder_words = re.split(r"[^\w]+", folder)
+        while term_idx < total_terms:
+            t = location_terms[term_idx].lower()
+            matched = False
+            if folder == t or folder.startswith(t):
+                matched = True
+            else:
+                for fw in folder_words:
+                    if fw == t or (len(t) >= 3 and fw.startswith(t)):
+                        matched = True
+                        break
+            if matched:
+                term_idx += 1
+            else:
+                break
+        if term_idx >= total_terms:
+            return True
+
+    return term_idx >= total_terms
+
+
+def parse_query(q: str, vocab: set[str] | None = None) -> ParsedQuery:
+    """Parse raw query into ParsedQuery with location phrases, directory flags, and typo corrections."""
+    raw_clean = q.strip().strip("'\"").strip()
+    if not raw_clean:
+        return ParsedQuery(tokens=[], ext_filter=[], want_dir=False, location_terms=[], corrections={}, raw=q)
+
+    corrections: dict[str, str] = {}
     ext_filters: list[str] = []
+    want_dir = False
 
-    # First inspect raw string for path fragments containing location words (e.g. "krith\\downloads")
-    # Split by whitespace into chunks
-    chunks = raw.split()
-    remaining_words: list[str] = []
+    # 1. Location phrase extraction: "in / inside / under / from / within / at / on <folder>"
+    loc_match = re.search(r"\b(in|inside|under|from|within|at|on)\s+(.+)$", raw_clean, flags=re.IGNORECASE)
+    if loc_match:
+        loc_part = loc_match.group(2).strip()
+        query_text = raw_clean[:loc_match.start()].strip()
+        loc_terms = [t.lower().strip() for t in re.split(r"[\s/\\]+", loc_part) if t.strip()]
+        loc_terms = [re.sub(r"^[^\w]+|[^\w]+$", "", t) for t in loc_terms if re.sub(r"^[^\w]+|[^\w]+$", "", t)]
+    else:
+        query_text = raw_clean
+        loc_terms = []
 
-    for chunk in chunks:
-        # Check if chunk contains slashes/backslashes
-        if "\\" in chunk or "/" in chunk:
-            segments = [s.strip().lower() for s in re.split(r"[\\/]+", chunk) if s.strip()]
-            loc_found = False
-            for seg in segments:
-                if seg in LOCATION_WORDS:
-                    target_folder = LOCATION_WORDS[seg]
-                    root_hint = _resolve_location_folder(target_folder)
-                    loc_found = True
-                    break
-            if loc_found:
-                # Discard path prefix/fragment from name tokens
-                continue
+    # 2. Extract standalone location aliases if there are other tokens in query_text
+    chunks = query_text.split()
+    if len(chunks) > 1:
+        kept_chunks = []
+        for ch in chunks:
+            ch_clean = ch.lower().strip(",;:")
+            if ch_clean in STANDALONE_ALIASES and "." not in ch:
+                if ch_clean not in loc_terms:
+                    loc_terms.append(ch_clean)
+            else:
+                kept_chunks.append(ch)
+        query_text = " ".join(kept_chunks)
 
-        remaining_words.append(chunk)
+    # 3. Tokenize on spaces, commas, semicolons, underscores, etc.
+    raw_tokens = [t.strip() for t in re.split(r"[\s,;:\"'()\[\]{}]+", query_text) if t.strip()]
 
-    normalized_text = " ".join(remaining_words).lower()
-    # Replace punctuation except dots and alphanumerics
-    cleaned = re.sub(r"[,;:\'\"`\(\)\[\]\{\}\?!#\*\+=]+", " ", normalized_text)
-    tokens = [t.strip() for t in re.split(r"\s+", cleaned) if t.strip()]
+    # Load index vocabulary if not provided
+    if vocab is None:
+        try:
+            from plugins.file_index import file_indexer  # noqa: PLC0415
+            vocab = file_indexer.get_vocabulary()
+        except Exception:
+            vocab = set()
 
     name_tokens: list[str] = []
 
-    for token in tokens:
-        # Check for explicit extension: e.g. ".pdf" or "name.pdf"
-        if "." in token:
-            parts = token.rsplit(".", 1)
-            stem_part, ext_part = parts[0], f".{parts[1]}"
-            if len(parts[1]) >= 1 and parts[1].isalnum():
-                if ext_part not in ext_filters:
-                    ext_filters.append(ext_part)
+    for tok in raw_tokens:
+        tok_l = tok.lower()
+
+        # Check explicit dot-extension: e.g. "tree.txt" or "tree.rxt"
+        if "." in tok:
+            parts = tok.rsplit(".", 1)
+            stem_part, ext_part = parts[0], parts[1].lower()
+            if ext_part.isalnum():
+                if ext_part in COMMON_EXTS or f".{ext_part}" in TYPE_EXTENSIONS:
+                    target_ext = f".{ext_part}"
+                else:
+                    close_ext = difflib.get_close_matches(ext_part, COMMON_EXTS, n=1, cutoff=0.6)
+                    if close_ext:
+                        target_ext = f".{close_ext[0]}"
+                        corrections[f".{ext_part}"] = target_ext
+                    else:
+                        target_ext = f".{ext_part}"
+                if target_ext not in ext_filters:
+                    ext_filters.append(target_ext)
+
                 if stem_part:
-                    for sw in split_stem_tokens(stem_part):
-                        if sw not in FILLER_TOKENS:
-                            name_tokens.append(sw)
+                    for sub_w in split_stem_tokens(stem_part):
+                        if sub_w not in FILLER_TOKENS:
+                            name_tokens.append(sub_w)
                 continue
 
-        # Check for location words
-        if token in LOCATION_WORDS:
-            if root_hint is None:
-                root_hint = _resolve_location_folder(LOCATION_WORDS[token])
-            continue
+        # Split on underscores or non-alphanumerics inside token
+        sub_tokens = split_stem_tokens(tok_l)
+        for w in sub_tokens:
+            if not w:
+                continue
 
-        # Check for type words
-        if token in TYPE_EXTENSIONS:
-            for ext in TYPE_EXTENSIONS[token]:
-                if ext not in ext_filters:
-                    ext_filters.append(ext)
-            continue
+            # Check fuzzy vocabulary for commands/types/fillers (len >= 4)
+            if len(w) >= 4 and w not in CANONICAL_VOCAB and w not in FILLER_TOKENS:
+                close = difflib.get_close_matches(w, CANONICAL_VOCAB, n=1, cutoff=0.82)
+                if close:
+                    canonical = close[0]
+                    corrections[w] = canonical
+                    w = canonical
 
-        # Check for filler tokens
-        if token in FILLER_TOKENS:
-            continue
+            # Check if directory keyword
+            if w in DIR_WORDS:
+                want_dir = True
+                continue
 
-        # Regular name token - normalize numerals and split camelCase / underscores
-        for sw in split_stem_tokens(token):
-            if sw not in FILLER_TOKENS:
-                name_tokens.append(sw)
+            # Check if type keyword
+            if w in TYPE_EXTENSIONS:
+                for e in TYPE_EXTENSIONS[w]:
+                    if e not in ext_filters:
+                        ext_filters.append(e)
+                continue
 
-    return name_tokens, ext_filters, root_hint
+            # Check if filler token
+            if w in FILLER_TOKENS or w in ("send", "sent", "share", "give", "get", "find", "show", "search", "file", "files"):
+                continue
+
+            # Name typo tolerance using index vocabulary (len >= 4)
+            if len(w) >= 4 and vocab and w not in vocab:
+                close_name = difflib.get_close_matches(w, vocab, n=1, cutoff=0.8)
+                if close_name:
+                    corrections[w] = close_name[0]
+                    w = close_name[0]
+
+            name_tokens.append(w)
+
+    return ParsedQuery(
+        tokens=name_tokens,
+        ext_filter=ext_filters,
+        want_dir=want_dir,
+        location_terms=loc_terms,
+        corrections=corrections,
+        raw=q,
+    )
 
 
 def _resolve_location_folder(folder_name: str) -> Path:
@@ -746,67 +904,110 @@ def _resolve_location_folder(folder_name: str) -> Path:
     return (Path.home() / folder_name).resolve()
 
 
+def _score_candidate(candidate: Path, pq: ParsedQuery) -> tuple[int, float, float, int] | None:
+    """Evaluate candidate file against ParsedQuery.
+
+    Returns tuple (tier, matched_ratio, mtime, neg_path_len) or None if no match.
+    Tier 1 is Tier A (100% matched), Tier 2 is Tier B (>= 60% matched).
+    """
+    if is_sensitive_path(candidate) or is_excluded_path(candidate):
+        return None
+    if candidate.name.startswith("."):
+        return None
+
+    try:
+        is_dir = candidate.is_dir()
+    except (OSError, PermissionError):
+        return None
+
+    if pq.want_dir and not is_dir:
+        return None
+
+    if pq.location_terms and not _path_matches_location(candidate, pq.location_terms):
+        return None
+
+    if pq.ext_filter and not pq.want_dir:
+        if candidate.suffix.lower() not in pq.ext_filter:
+            return None
+
+    try:
+        st = candidate.stat()
+        mtime = st.st_mtime
+    except Exception:
+        mtime = 0.0
+
+    neg_len = -len(str(candidate))
+
+    if not pq.tokens:
+        # No specific name tokens: matched by ext or want_dir or location
+        return (1, 1.0, mtime, neg_len)
+
+    cand_tokens = split_stem_tokens(candidate.stem)
+    parent_tokens: list[str] = []
+    if not pq.location_terms:
+        for p in candidate.parents:
+            if p.name:
+                parent_tokens.extend(split_stem_tokens(p.name))
+
+    matched_tokens = 0
+    total_q = len(pq.tokens)
+
+    for q_tok in pq.tokens:
+        # Match candidate stem
+        stem_match = any(c == q_tok or (len(q_tok) >= 3 and c.startswith(q_tok)) for c in cand_tokens)
+        if stem_match:
+            matched_tokens += 1
+            continue
+        # Match extension as a token
+        if candidate.suffix.lower().lstrip(".") == q_tok:
+            matched_tokens += 1
+            continue
+        # Match parent folder if location_terms was empty
+        if not pq.location_terms:
+            parent_match = any(p == q_tok or (len(q_tok) >= 3 and p.startswith(q_tok)) for p in parent_tokens)
+            if parent_match:
+                matched_tokens += 1
+                continue
+
+    ratio = matched_tokens / total_q
+
+    if matched_tokens == total_q:
+        return (1, 1.0, mtime, neg_len)
+
+    if total_q >= 2 and ratio >= 0.6:
+        return (2, ratio, mtime, neg_len)
+
+    return None
+
+
 def _match_candidate(
     candidate: Path,
     name_tokens: list[str],
     ext_filters: list[str],
 ) -> tuple[int, bool] | None:
-    """Evaluate candidate file.
+    """Evaluate candidate file for backward-compatibility.
 
     Returns tuple (tier_score, approximate) or None if no match.
     Tier A returns (100, False), Tier B returns (60, True).
     """
-    if is_sensitive_path(candidate):
+    pq = ParsedQuery(
+        tokens=name_tokens,
+        ext_filter=ext_filters,
+        want_dir=False,
+        location_terms=[],
+        corrections={},
+        raw="",
+    )
+    res = _score_candidate(candidate, pq)
+    if res is None:
         return None
-    if candidate.name.startswith("."):
-        return None
-
-    if ext_filters:
-        if candidate.suffix.lower() not in ext_filters:
-            return None
-
-    if not name_tokens:
-        # Only extension or location filter was specified
-        return (100, False)
-
-    cand_tokens = split_stem_tokens(candidate.stem)
-    if not cand_tokens:
-        return None
-
-    # Check exact stem match
-    if cand_tokens == name_tokens:
-        return (110, False)
-
-    # Match each query token against candidate tokens
-    matched_q_indices: list[int] = []
-    matched_c_indices: list[int] = []
-
-    for q_idx, q_tok in enumerate(name_tokens):
-        for c_idx, c_tok in enumerate(cand_tokens):
-            if c_idx in matched_c_indices:
-                continue
-            # Equal match or candidate token starts with query token (length >= 3)
-            if c_tok == q_tok or (len(q_tok) >= 3 and c_tok.startswith(q_tok)):
-                matched_q_indices.append(q_idx)
-                matched_c_indices.append(c_idx)
-                break
-
-    matched_count = len(matched_q_indices)
-    total_q = len(name_tokens)
-
-    # Tier A: All query tokens matched
-    if matched_count == total_q:
-        # Check token order
-        is_in_order = matched_c_indices == sorted(matched_c_indices)
-        score = 105 if is_in_order else 100
+    tier, ratio, _, _ = res
+    if tier == 1:
+        # Check exact stem match bonus
+        cand_tokens = split_stem_tokens(candidate.stem)
+        score = 110 if cand_tokens == name_tokens else 100
         return (score, False)
-
-    # Tier B: at least ceil(60%) of tokens matched, query >= 2 tokens, and matched >= 2
-    threshold = math.ceil(0.6 * total_q)
-    if total_q >= 2 and matched_count >= threshold and matched_count >= 2:
-        return (60, True)
-
-    return None
+    return (60, True)
 
 
 def get_search_roots() -> list[Path]:
@@ -896,6 +1097,7 @@ def _scan_root(
     scored_matches: list[tuple[int, float, FileMatch]],
     timeout_sec: float | None = None,
     start_time: float | None = None,
+    pq: ParsedQuery | None = None,
 ) -> bool:
     """Walk root_dir and collect matches. Returns True if timed out."""
     visited_dirs: set[Path] = set()
@@ -919,6 +1121,27 @@ def _scan_root(
             if not _should_skip_dir(d, curr_p / d)
         ]
 
+        # Check directories
+        for d in dirs:
+            if d.startswith("."):
+                continue
+            dir_path = curr_p / d
+            if is_excluded_path(dir_path) or is_sensitive_path(dir_path):
+                continue
+            res = _score_candidate(dir_path, pq) if pq else _match_candidate(dir_path, name_tokens, ext_filters)
+            if res is not None:
+                if pq:
+                    tier, _, mtime, _ = res
+                    approx = (tier == 2)
+                    score = 100 if tier == 1 else 60
+                else:
+                    score, approx = res
+                try:
+                    st = dir_path.stat()
+                    scored_matches.append((score, st.st_mtime, FileMatch(path=dir_path, size=st.st_size, mtime=st.st_mtime, approximate=approx)))
+                except Exception:
+                    pass
+
         # Check files
         for f in files:
             if f.startswith("."):
@@ -926,9 +1149,14 @@ def _scan_root(
             file_path = curr_p / f
             if is_excluded_path(file_path) or is_sensitive_path(file_path):
                 continue
-            res = _match_candidate(file_path, name_tokens, ext_filters)
+            res = _score_candidate(file_path, pq) if pq else _match_candidate(file_path, name_tokens, ext_filters)
             if res is not None:
-                score, approx = res
+                if pq:
+                    tier, _, mtime, _ = res
+                    approx = (tier == 2)
+                    score = 100 if tier == 1 else 60
+                else:
+                    score, approx = res
                 try:
                     st = file_path.stat()
                     scored_matches.append((score, st.st_mtime, FileMatch(path=file_path, size=st.st_size, mtime=st.st_mtime, approximate=approx)))
@@ -945,6 +1173,7 @@ def _scan_home_wide(
     searched_tier1_paths: set[str],
     scored_matches: list[tuple[int, float, FileMatch]],
     timeout_sec: float = 6.0,
+    pq: ParsedQuery | None = None,
 ) -> None:
     """Tier 2 scan: Walk rest of Path.home() capped at timeout_sec."""
     t0 = time.perf_counter()
@@ -955,9 +1184,14 @@ def _scan_home_wide(
                     break
                 if not entry.is_dir():
                     if not entry.name.startswith("."):
-                        res = _match_candidate(entry, name_tokens, ext_filters)
+                        res = _score_candidate(entry, pq) if pq else _match_candidate(entry, name_tokens, ext_filters)
                         if res is not None:
-                            score, approx = res
+                            if pq:
+                                tier, _, mtime, _ = res
+                                approx = (tier == 2)
+                                score = 100 if tier == 1 else 60
+                            else:
+                                score, approx = res
                             try:
                                 st = entry.stat()
                                 scored_matches.append((score, st.st_mtime, FileMatch(path=entry, size=st.st_size, mtime=st.st_mtime, approximate=approx)))
@@ -982,6 +1216,7 @@ def _scan_home_wide(
                     scored_matches=scored_matches,
                     timeout_sec=timeout_sec,
                     start_time=t0,
+                    pq=pq,
                 )
                 if timed_out:
                     break
@@ -994,6 +1229,10 @@ def search_files(query: str, file_type: str = "", max_results: int = 5) -> list[
     t_start = time.perf_counter()
     cleaned_query = query.strip().strip('"\'')
     if not cleaned_query:
+        return []
+
+    # Early rejection for denylist keywords
+    if check_denylist_rejection(cleaned_query):
         return []
 
     # 1. Direct path resolution (supports / and \\)
@@ -1010,15 +1249,15 @@ def search_files(query: str, file_type: str = "", max_results: int = 5) -> list[
     except Exception:
         pass
 
-    name_tokens, ext_filters, root_hint = parse_query(cleaned_query)
+    pq = parse_query(cleaned_query)
 
     if file_type:
         clean_ext = file_type.strip().lower()
         clean_ext = clean_ext if clean_ext.startswith(".") else f".{clean_ext}"
-        if clean_ext not in ext_filters:
-            ext_filters.append(clean_ext)
+        if clean_ext not in pq.ext_filter:
+            pq.ext_filter.append(clean_ext)
 
-    if not name_tokens and not ext_filters and not root_hint:
+    if not pq.tokens and not pq.ext_filter and not pq.location_terms and not pq.want_dir:
         return []
 
     # Determine search roots
@@ -1037,121 +1276,113 @@ def search_files(query: str, file_type: str = "", max_results: int = 5) -> list[
     from plugins.file_index import file_indexer  # noqa: PLC0415
     index_ready = bool(file_indexer.has_completed_crawl() or file_indexer.is_ready())
 
+    raw_candidates: list[Path] = []
+    index_ms = 0.0
+    live_ms = 0.0
+
     if index_ready:
         t0 = time.perf_counter()
         index_matches = file_indexer.search(
-            name_tokens=name_tokens,
-            ext_filters=ext_filters,
-            max_results=max_results * 4,
+            name_tokens=pq.tokens,
+            ext_filters=pq.ext_filter,
+            max_results=max_results * 8,
         )
-        if root_hint is not None:
-            try:
-                rh = root_hint.resolve()
-                index_matches = [m for m in index_matches if rh in m.path.resolve().parents or m.path.resolve() == rh]
-            except Exception:
-                pass
-        elif override_roots:
-            index_matches = [
-                m for m in index_matches
-                if any(r in m.path.resolve().parents or m.path.resolve() == r for r in override_roots)
-            ]
+        for m in index_matches:
+            raw_candidates.append(m.path)
         index_ms = (time.perf_counter() - t0) * 1000.0
 
         t1 = time.perf_counter()
-        live_matches = _scan_tier1_fast(name_tokens, ext_filters, timeout_sec=1.0)
-        if root_hint is not None:
+        live_matches = _scan_tier1_fast(pq.tokens, pq.ext_filter, timeout_sec=1.0)
+        for m in live_matches:
+            raw_candidates.append(m.path)
+        live_ms = (time.perf_counter() - t1) * 1000.0
+    else:
+        t1 = time.perf_counter()
+        scored_matches: list[tuple[int, float, FileMatch]] = []
+        if override_roots:
+            for r in override_roots:
+                _scan_root(r, pq.tokens, pq.ext_filter, scored_matches, pq=pq)
+        else:
+            home = Path.home()
+            priority_subdirs = ["Desktop", "Downloads", "Documents", "Pictures", "Videos", "Music"]
+            tier1_roots: list[Path] = []
+            for d in priority_subdirs:
+                p = home / d
+                if p.is_dir() and not is_sensitive_path(p):
+                    tier1_roots.append(p.resolve())
             try:
-                rh = root_hint.resolve()
-                live_matches = [m for m in live_matches if rh in m.path.resolve().parents or m.path.resolve() == rh]
+                for p in home.iterdir():
+                    if p.is_dir() and p.name.lower().startswith("onedrive") and not is_sensitive_path(p):
+                        for d in priority_subdirs:
+                            od_sub = p / d
+                            if od_sub.is_dir() and not is_sensitive_path(od_sub):
+                                tier1_roots.append(od_sub.resolve())
             except Exception:
                 pass
-        elif override_roots:
-            live_matches = [
-                m for m in live_matches
-                if any(r in m.path.resolve().parents or m.path.resolve() == r for r in override_roots)
-            ]
+
+            searched_tier1_paths: set[str] = set()
+            for root in tier1_roots:
+                searched_tier1_paths.add(str(root).lower())
+                _scan_root(root, pq.tokens, pq.ext_filter, scored_matches, pq=pq)
+
+            # Check if any candidate is Tier A
+            has_tier_a = False
+            for _, _, m in scored_matches:
+                res = _score_candidate(m.path, pq)
+                if res and res[0] == 1:
+                    has_tier_a = True
+
+            if not has_tier_a:
+                _scan_home_wide(
+                    home=home,
+                    name_tokens=pq.tokens,
+                    ext_filters=pq.ext_filter,
+                    searched_tier1_paths=searched_tier1_paths,
+                    scored_matches=scored_matches,
+                    timeout_sec=6.0,
+                    pq=pq,
+                )
+
+        for _, _, m in scored_matches:
+            raw_candidates.append(m.path)
         live_ms = (time.perf_counter() - t1) * 1000.0
 
-        seen_paths: set[Path] = set()
-        merged_scored: list[tuple[int, float, FileMatch]] = []
+    # Two-tier ranking
+    seen_paths: set[Path] = set()
+    tier_a_matches: list[tuple[float, float, int, FileMatch]] = []
+    tier_b_matches: list[tuple[float, float, int, FileMatch]] = []
 
-        for m in live_matches + index_matches:
-            try:
-                res_p = m.path.resolve()
-            except Exception:
-                res_p = m.path
-            if res_p in seen_paths:
-                continue
-            seen_paths.add(res_p)
-            match_res = _match_candidate(m.path, name_tokens, ext_filters)
-            if match_res is not None:
-                score, approx = match_res
-                merged_scored.append((score, m.mtime, FileMatch(path=m.path, size=m.size, mtime=m.mtime, approximate=approx)))
-
-        merged_scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        results = [match for _, _, match in merged_scored[:max_results]]
-        total_ms = (time.perf_counter() - t_start) * 1000.0
-        log.info("search timing: index_ms=%.1f live_ms=%.1f total_ms=%.1f results=%d", index_ms, live_ms, total_ms, len(results))
-        return results
-
-    # Index has NOT completed crawl: fallback to live walk with Tier 2
-    index_ms = 0.0
-    t1 = time.perf_counter()
-    home = Path.home()
-    priority_subdirs = ["Desktop", "Downloads", "Documents", "Pictures", "Videos", "Music"]
-    scored_matches: list[tuple[int, float, FileMatch]] = []
-
-    if root_hint is not None and root_hint.exists() and root_hint.is_dir():
-        _scan_root(root_hint, name_tokens, ext_filters, scored_matches)
-    elif override_roots:
-        for r in override_roots:
-            _scan_root(r, name_tokens, ext_filters, scored_matches)
-    else:
-        tier1_roots: list[Path] = []
-        for d in priority_subdirs:
-            p = home / d
-            if p.is_dir() and not is_sensitive_path(p):
-                tier1_roots.append(p.resolve())
-
-        # OneDrive folders
+    for cand in raw_candidates:
         try:
-            for p in home.iterdir():
-                if p.is_dir() and p.name.lower().startswith("onedrive") and not is_sensitive_path(p):
-                    for d in priority_subdirs:
-                        od_sub = p / d
-                        if od_sub.is_dir() and not is_sensitive_path(od_sub):
-                            tier1_roots.append(od_sub.resolve())
+            cand_res = cand.resolve()
         except Exception:
-            pass
+            cand_res = cand
+        if cand_res in seen_paths:
+            continue
+        seen_paths.add(cand_res)
 
-        searched_tier1_paths: set[str] = set()
-        for root in tier1_roots:
-            searched_tier1_paths.add(str(root).lower())
-            _scan_root(root, name_tokens, ext_filters, scored_matches)
+        score_res = _score_candidate(cand_res, pq)
+        if score_res is not None:
+            tier, ratio, mtime, neg_len = score_res
+            try:
+                st = cand_res.stat()
+                sz = st.st_size
+            except Exception:
+                sz = 0
+            match_obj = FileMatch(path=cand_res, size=sz, mtime=mtime, approximate=(tier == 2))
+            if tier == 1:
+                tier_a_matches.append((ratio, mtime, neg_len, match_obj))
+            else:
+                tier_b_matches.append((ratio, mtime, neg_len, match_obj))
 
-        # If any Tier A match found, do not run Tier 2
-        has_tier_a = any(score >= 100 for score, _, _ in scored_matches)
-        if not has_tier_a:
-            _scan_home_wide(
-                home=home,
-                name_tokens=name_tokens,
-                ext_filters=ext_filters,
-                searched_tier1_paths=searched_tier1_paths,
-                scored_matches=scored_matches,
-                timeout_sec=6.0,
-            )
+    tier_a_matches.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    tier_b_matches.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
 
-    scored_matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    seen: set[Path] = set()
-    results: list[FileMatch] = []
-    for _, _, match in scored_matches:
-        if match.path not in seen:
-            seen.add(match.path)
-            results.append(match)
-            if len(results) >= max_results:
-                break
+    if tier_a_matches:
+        results = [m for _, _, _, m in tier_a_matches[:max_results]]
+    else:
+        results = [m for _, _, _, m in tier_b_matches[:min(5, max_results)]]
 
-    live_ms = (time.perf_counter() - t1) * 1000.0
     total_ms = (time.perf_counter() - t_start) * 1000.0
     log.info("search timing: index_ms=%.1f live_ms=%.1f total_ms=%.1f results=%d", index_ms, live_ms, total_ms, len(results))
     return results
@@ -1179,11 +1410,16 @@ def resolve_share_target(raw_input: str) -> tuple[Path | None, list[FileMatch], 
     if not clean_input:
         return None, [], "Please specify the file or folder path to share."
 
+    # Early rejection for denylist keywords
+    denial = check_denylist_rejection(clean_input)
+    if denial:
+        return None, [], denial
+
     # 1. Try resolve_user_path (handles aliases like "Downloads", "~", hallucinated users, relative tails)
     cand = resolve_user_path(clean_input)
     if cand is not None and cand.exists():
         if is_sensitive_path(cand):
-            return None, [], f"⚠️ Access denied: '{cand.name}' is a protected or sensitive file."
+            return None, [], f"I cannot share protected or sensitive files ({cand.name})."
         return cand, [], None
 
     # 2. Try direct path on disk
@@ -1191,7 +1427,7 @@ def resolve_share_target(raw_input: str) -> tuple[Path | None, list[FileMatch], 
         direct_p = Path(os.path.expandvars(os.path.expanduser(clean_input))).resolve()
         if direct_p.exists():
             if is_sensitive_path(direct_p):
-                return None, [], f"⚠️ Access denied: '{direct_p.name}' is a protected or sensitive file."
+                return None, [], f"I cannot share protected or sensitive files ({direct_p.name})."
             return direct_p, [], None
     except Exception:
         pass
@@ -1204,13 +1440,14 @@ def resolve_share_target(raw_input: str) -> tuple[Path | None, list[FileMatch], 
             matches = search_files(leaf)
 
     if not matches:
-        return None, [], f"No file found matching '{raw_input}'."
+        miss_msg = format_miss_reply(clean_input)
+        return None, [], f"No file found matching '{clean_input}'. {miss_msg}"
 
     # 4. Check single match vs multiple matches
     if len(matches) == 1:
         target = matches[0].path
         if is_sensitive_path(target):
-            return None, [], f"⚠️ Access denied: '{target.name}' is a protected or sensitive file."
+            return None, [], f"I cannot share protected or sensitive files ({target.name})."
         return target, matches, None
 
     # Check for 1 exact Tier-A stem or filename match among multiple matches

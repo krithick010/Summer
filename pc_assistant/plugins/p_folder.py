@@ -19,6 +19,7 @@ from typing import Any
 
 from plugins.base import PluginBase, PluginResult
 from plugins.file_search import (
+    format_size,
     is_excluded_path,
     is_reparse_point,
     is_sensitive_path,
@@ -32,12 +33,8 @@ PAGE_SIZE = 8
 
 
 def _format_size(size_bytes: int) -> str:
-    """Format file size in B, KB, or MB."""
-    if size_bytes < 1024:
-        return f"{size_bytes} B"
-    if size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.1f} KB"
-    return f"{size_bytes / (1024 * 1024):.1f} MB"
+    """Format file size in human-readable B, KB, MB, or GB string."""
+    return format_size(size_bytes)
 
 
 class ListFolderPlugin(PluginBase):

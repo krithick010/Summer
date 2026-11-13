@@ -4191,6 +4191,156 @@ class TestPhase1FileIndex(unittest.TestCase):
                     mock_home_wide.assert_called_once()
 
 
+class TestPhase2SearchV3(unittest.TestCase):
+    """Hermetic unit tests for Phase 2: Search v3 (locations, folders, typos, honest misses, denylist, format_size)."""
+
+    def test_parse_query_locations_and_aliases(self):
+        from plugins.file_search import parse_query
+
+        # Location preposition and deep path
+        pq = parse_query("tree.txt in documents/Coding Research/dsa")
+        self.assertEqual(pq.tokens, ["tree"])
+        self.assertEqual(pq.ext_filter, [".txt"])
+        self.assertFalse(pq.want_dir)
+        self.assertEqual(pq.location_terms, ["documents", "coding", "research", "dsa"])
+
+        # Folder keyword sets want_dir
+        pq_dir = parse_query("potential wallpapers folder")
+        self.assertEqual(pq_dir.tokens, ["potential", "wallpapers"])
+        self.assertTrue(pq_dir.want_dir)
+        self.assertNotIn("folder", pq_dir.tokens)
+
+        # Standalone alias extraction with filler tokens removed
+        pq_fill = parse_query("send me aicte final file in downloads")
+        self.assertEqual(pq_fill.tokens, ["aicte", "final"])
+        self.assertEqual(pq_fill.location_terms, ["downloads"])
+
+        # Underscore splitting
+        pq_under = parse_query("aicte_final")
+        self.assertEqual(pq_under.tokens, ["aicte", "final"])
+
+    def test_parse_query_fuzzy_vocab_and_typos(self):
+        from plugins.file_search import parse_query
+
+        # "filder" fuzzy matches "folder" -> want_dir=True
+        pq_filder = parse_query("filder")
+        self.assertTrue(pq_filder.want_dir)
+        self.assertEqual(pq_filder.corrections.get("filder"), "folder")
+
+        # "shre" fuzzy matches "share" -> dropped as filler
+        pq_shre = parse_query("shre my notes.txt")
+        self.assertEqual(pq_shre.corrections.get("shre"), "share")
+        self.assertEqual(pq_shre.tokens, ["notes"])
+        self.assertEqual(pq_shre.ext_filter, [".txt"])
+
+        # "tree.rxt" extension typo -> .txt
+        pq_ext = parse_query("tree.rxt")
+        self.assertIn(".txt", pq_ext.ext_filter)
+        self.assertEqual(pq_ext.corrections.get(".rxt"), ".txt")
+
+        # Name typo tolerance with index vocab
+        custom_vocab = {"wallpaper", "financial", "report"}
+        pq_typo = parse_query("wallpapr", vocab=custom_vocab)
+        self.assertEqual(pq_typo.tokens, ["wallpaper"])
+        self.assertEqual(pq_typo.corrections.get("wallpapr"), "wallpaper")
+
+    def test_location_terms_in_order_matching(self):
+        import config
+        from plugins.file_search import search_files
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            # Create subfolder chain: Documents / Coding Research / dsa / tree.txt
+            target_dir = base / "Documents" / "Coding Research" / "dsa"
+            target_dir.mkdir(parents=True)
+            target_file = target_dir / "tree.txt"
+            target_file.write_text("correct target")
+
+            # Create other folder: Desktop / tree.txt
+            other_dir = base / "Desktop"
+            other_dir.mkdir(parents=True)
+            other_file = other_dir / "tree.txt"
+            other_file.write_text("wrong target")
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", str(base)), \
+                 patch.object(config, "FILE_SEARCH_MODE", "custom"):
+                matches = search_files("tree.txt in documents/Coding Research/dsa")
+                self.assertEqual(len(matches), 1)
+                self.assertEqual(matches[0].path.resolve(), target_file.resolve())
+
+    def test_two_tier_ranking_tier_a_vs_tier_b(self):
+        import config
+        from plugins.file_search import search_files
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            f_all = base / "annual_financial_report_2026.pdf"
+            f_all.write_text("all tokens")
+            f_partial = base / "annual_summary_2026.pdf"
+            f_partial.write_text("partial tokens")
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", str(base)), \
+                 patch.object(config, "FILE_SEARCH_MODE", "custom"):
+                # Tier A: all tokens matched (annual, financial, 2026)
+                matches_a = search_files("annual financial 2026 pdf")
+                self.assertEqual(len(matches_a), 1)
+                self.assertEqual(matches_a[0].path.resolve(), f_all.resolve())
+                self.assertFalse(matches_a[0].approximate)
+
+                # Tier B: 2 of 3 tokens matched (annual, 2026, audit) -> Tier A has 0, Tier B returns matches
+                matches_b = search_files("annual audit 2026 pdf")
+                self.assertGreaterEqual(len(matches_b), 1)
+                self.assertTrue(any(m.approximate for m in matches_b))
+
+    def test_denylist_early_rejection(self):
+        from plugins.file_search import check_denylist_rejection, search_files
+        from plugins.p_files import FindFilesPlugin
+
+        denial_pw = check_denylist_rejection("send me password.txt")
+        self.assertIsNotNone(denial_pw)
+        self.assertIn("protected or sensitive files", denial_pw)
+
+        denial_key = check_denylist_rejection("id_rsa key")
+        self.assertIsNotNone(denial_key)
+        self.assertIn("id_rsa", denial_key)
+
+        denial_env = check_denylist_rejection("find .env file")
+        self.assertIsNotNone(denial_env)
+        self.assertIn(".env", denial_env)
+
+        # search_files rejects denylist
+        self.assertEqual(search_files("my password.txt"), [])
+
+        # FindFilesPlugin execute rejects early
+        plugin = FindFilesPlugin()
+        res = _run(plugin.execute(query="find id_rsa"))
+        self.assertFalse(res.success)
+        self.assertIn("protected or sensitive files", res.output)
+
+    def test_honest_direct_reply_on_miss(self):
+        from plugins.file_search import format_miss_reply
+        from plugins.p_files import FindFilesPlugin
+
+        reply = format_miss_reply("nonexistent_rare_artifact_xyz")
+        self.assertIn("No matching files found for 'nonexistent_rare_artifact_xyz'", reply)
+        self.assertIn("searched", reply)
+        self.assertIn("indexed files across", reply)
+
+        plugin = FindFilesPlugin()
+        res = _run(plugin.execute(query="nonexistent_rare_artifact_xyz"))
+        self.assertFalse(res.success)
+        self.assertIn("No matching files found for 'nonexistent_rare_artifact_xyz'", res.output)
+
+    def test_format_size_never_zero_mb(self):
+        from plugins.file_search import format_size
+
+        self.assertEqual(format_size(500), "500 B")
+        self.assertEqual(format_size(3200), "3.1 KB")
+        self.assertNotIn("0.0 MB", format_size(3200))
+        self.assertEqual(format_size(15 * 1024 * 1024), "15.0 MB")
+        self.assertEqual(format_size(2 * 1024 * 1024 * 1024), "2.00 GB")
+
+
 class TestListFolder(unittest.TestCase):
     """Test ListFolderPlugin directory browsing, paging, security filtering, and inline callback handling."""
 
