@@ -22,21 +22,61 @@ import asyncio
 import base64
 import logging
 from email.message import EmailMessage
+import os
 from pathlib import Path
+from typing import Any
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
+import config
 from config import GMAIL_CREDENTIALS_PATH, GMAIL_SENDER_EMAIL, GMAIL_TOKEN_PATH
 from plugins.base import PluginBase, PluginResult
+from plugins.file_search import (
+    compress_to_zip,
+    is_outside_usual_folders,
+    is_sensitive_path,
+    is_soft_sensitive,
+    resolve_share_target,
+)
 
 log = logging.getLogger(__name__)
 
 # Grants send-only access. If you change scopes, delete the token file and
 # re-authenticate.
 _SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
+
+
+def resolve_recipient_email(raw_email: str) -> str:
+    """Resolve recipient email address, replacing 'me', 'self', or mock placeholders with user's configured email."""
+    val = (raw_email or "").strip()
+    clean = val.lower().strip("<>\"'")
+    default_email = getattr(config, "USER_DEFAULT_EMAIL", "") or getattr(config, "GMAIL_SENDER_EMAIL", "")
+    if not clean or clean in ("me", "self", "myself"):
+        return default_email or val
+
+    if default_email:
+        if clean in ("user@example.com", "friend@example.com", "me@example.com", "my_email@example.com"):
+            return default_email
+        if clean.endswith("@example.com") and not clean.startswith("partner@") and not clean.startswith("test@") and not clean.startswith("boss@"):
+            return default_email
+
+    return val
+
+
+def is_self_email(email_str: str) -> bool:
+    """Check if the recipient email corresponds to the user themselves."""
+    val = (email_str or "").strip().lower()
+    if not val or val in ("me", "self", "myself"):
+        return True
+    default = (getattr(config, "USER_DEFAULT_EMAIL", "") or getattr(config, "GMAIL_SENDER_EMAIL", "")).lower()
+    if default and val == default:
+        return True
+    if val in ("friend@example.com", "user@example.com", "me@example.com"):
+        return True
+    return False
 
 
 class GmailPlugin(PluginBase):
@@ -126,12 +166,55 @@ class GmailPlugin(PluginBase):
 
         return build("gmail", "v1", credentials=creds)
 
+    async def prepare_preview(self, kwargs: dict[str, Any]) -> str | None:
+        """Build HITL preview card with resolved recipient and attachment details."""
+        to_email: str = (kwargs.get("to_email") or kwargs.get("to") or "").strip()
+        resolved_recipient = resolve_recipient_email(to_email)
+        subject: str = kwargs.get("subject", "").strip()
+        body: str = kwargs.get("body", "").strip()
+        attachment_path: str | None = kwargs.get("attachment_path")
+
+        preview_lines = [
+            f"• To: {resolved_recipient or '(no recipient)'}",
+            f"• Subject: {subject or '(no subject)'}",
+        ]
+        if body:
+            preview_lines.append(f"• Body: {body[:100]}{'...' if len(body) > 100 else ''}")
+
+        if attachment_path:
+            att = Path(attachment_path) if Path(attachment_path).exists() else None
+            if att is None:
+                resolved_target, matches, err = await asyncio.to_thread(resolve_share_target, attachment_path)
+                att = resolved_target
+
+            if not att or not att.exists():
+                preview_lines.append(f"• Attachment: {attachment_path} (not found)")
+            elif is_sensitive_path(att):
+                preview_lines.append(f"• Attachment: {att.name} (BLOCKED - sensitive file)")
+            else:
+                try:
+                    if att.is_dir():
+                        size_bytes = sum(f.stat().st_size for f in att.rglob("*") if f.is_file())
+                    else:
+                        size_bytes = att.stat().st_size
+                    size_mb = size_bytes / (1024 * 1024)
+                except Exception:
+                    size_mb = 0.0
+                preview_lines.append(f"• Attachment: {att.name} ({size_mb:.1f} MB)")
+                if is_outside_usual_folders(att):
+                    preview_lines.append("⚠️ Note: attachment is outside your usual folders")
+                if is_soft_sensitive(att):
+                    preview_lines.append("⚠️ Note: attachment name looks sensitive")
+
+        return "\n".join(preview_lines)
+
     # ------------------------------------------------------------------
     # Plugin execution (called ONLY after Telegram approval)
     # ------------------------------------------------------------------
 
     async def execute(self, **kwargs) -> PluginResult:
         to_email: str = (kwargs.get("to_email") or kwargs.get("to") or "").strip()
+        to_email = resolve_recipient_email(to_email)
         subject: str  = kwargs.get("subject",  "").strip()
         body: str     = kwargs.get("body",     "").strip()
         attachment_path: str | None = kwargs.get("attachment_path")
@@ -145,10 +228,98 @@ class GmailPlugin(PluginBase):
                 error=f"Missing fields: {missing}",
             )
 
+        send_path: Path | None = None
+        is_temp_zip = False
+        original_name = ""
+        size_mb = 0.0
+
+        if attachment_path:
+            att = Path(attachment_path) if Path(attachment_path).exists() else None
+            if att is None:
+                resolved_target, matches, err = await asyncio.to_thread(resolve_share_target, attachment_path)
+                att = resolved_target
+
+            if not att or not att.exists():
+                return PluginResult(
+                    success=False,
+                    output=f"⚠️ Attachment file not found: `{attachment_path}`",
+                    error=f"Attachment not found: {attachment_path}",
+                )
+
+            if is_sensitive_path(att):
+                return PluginResult(
+                    success=False,
+                    output=f"⚠️ Access denied: '{att.name}' is a protected or sensitive file.",
+                    error="Sensitive file access blocked",
+                )
+
+            original_name = att.name
+            send_path = att
+
+            if send_path.is_dir():
+                tmp_shares_dir = Path(config.DATA_DIR) / "tmp_shares"
+                tmp_shares_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    send_path = await asyncio.to_thread(compress_to_zip, send_path, tmp_shares_dir)
+                    is_temp_zip = True
+                except Exception as exc:
+                    return PluginResult(
+                        success=False,
+                        output=f"⚠️ Failed to compress directory '{original_name}': {exc}",
+                        error=str(exc),
+                    )
+
+            try:
+                if send_path.is_file():
+                    size_mb = os.path.getsize(str(send_path)) / (1024 * 1024)
+                else:
+                    size_mb = sum(os.path.getsize(str(f)) for f in send_path.rglob("*") if f.is_file()) / (1024 * 1024)
+            except Exception as exc:
+                if is_temp_zip:
+                    send_path.unlink(missing_ok=True)
+                return PluginResult(
+                    success=False,
+                    output=f"⚠️ Could not check attachment size: {exc}",
+                    error=str(exc),
+                )
+
+            # Check size limits
+            if size_mb > 25.0:
+                is_self = is_self_email(to_email)
+                if is_self and size_mb <= 50.0:
+                    direct_reply = f"📧 '{original_name}' ({size_mb:.1f} MB) exceeds Gmail's 25 MB limit, so I sent it here on Telegram instead."
+                    return PluginResult(
+                        success=True,
+                        output=direct_reply,
+                        data={
+                            "send_files": [{
+                                "path": str(send_path),
+                                "filename": send_path.name,
+                                "kind": "document",
+                                "cleanup": is_temp_zip,
+                            }],
+                            "direct_reply": direct_reply,
+                        },
+                    )
+
+                if is_temp_zip:
+                    send_path.unlink(missing_ok=True)
+                limit_msg = f"⚠️ Attachment '{original_name}' is {size_mb:.1f} MB (Gmail attachment limit is 25 MB)."
+                return PluginResult(
+                    success=False,
+                    output=limit_msg,
+                    error="Attachment exceeds Gmail 25 MB limit",
+                    data={"direct_reply": limit_msg},
+                )
+
         try:
             # Build + send in a thread (googleapiclient is blocking I/O)
             result = await asyncio.to_thread(
-                self._build_and_send, to_email, subject, body, attachment_path
+                self._build_and_send,
+                to_email,
+                subject,
+                body,
+                str(send_path) if send_path else None,
             )
             return result
         except FileNotFoundError as exc:
@@ -169,6 +340,9 @@ class GmailPlugin(PluginBase):
                 output=f"⚠️ Gmail API error: `{exc}`",
                 error=str(exc),
             )
+        finally:
+            if is_temp_zip and send_path:
+                send_path.unlink(missing_ok=True)
 
     # ------------------------------------------------------------------
     # Blocking helper (runs inside asyncio.to_thread)
@@ -183,7 +357,6 @@ class GmailPlugin(PluginBase):
     ) -> PluginResult:
         if attachment_path:
             import mimetypes
-            import os
 
             att = Path(attachment_path)
             if not att.exists():
@@ -229,7 +402,12 @@ class GmailPlugin(PluginBase):
 
         log.info("Email sent to %s | subject: %r (attachment: %s)", to_email, subject, attachment_path)
         att_line = f"\n📎 *Attachment:* `{Path(attachment_path).name}`" if attachment_path else ""
-        data: dict[str, Any] = {"to": to_email, "subject": subject}
+        direct_reply = f"📧 Email sent to {to_email} (Subject: '{subject}')."
+        data: dict[str, Any] = {
+            "to": to_email,
+            "subject": subject,
+            "direct_reply": direct_reply,
+        }
         if attachment_path:
             data["attachment"] = str(attachment_path)
         return PluginResult(

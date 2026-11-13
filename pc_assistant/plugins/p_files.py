@@ -323,9 +323,9 @@ class ShareFilePlugin(PluginBase):
         is_email = (delivery == "email") or ("email" in delivery) or ("mail" in delivery)
 
         if is_email:
-            from plugins.p_gmail import GmailPlugin
+            from plugins.p_gmail import GmailPlugin, resolve_recipient_email
             gmail_plugin = GmailPlugin()
-            resolved_recipient = to_email or config.USER_DEFAULT_EMAIL or config.GMAIL_SENDER_EMAIL
+            resolved_recipient = resolve_recipient_email(to_email) or config.USER_DEFAULT_EMAIL or config.GMAIL_SENDER_EMAIL
             if not resolved_recipient:
                 if is_temp_zip:
                     send_path.unlink(missing_ok=True)

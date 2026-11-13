@@ -4422,5 +4422,121 @@ class TestPhase2ShareFileResolution(unittest.TestCase):
                         self.assertNotIn("consider using email for files under 25 mb", res.output.lower())
 
 
+class TestPhase3SmartEmailResolution(unittest.TestCase):
+    """Test smart recipient and attachment resolution for send_email and share_file."""
+
+    def test_resolve_recipient_email(self):
+        import config
+        from plugins.p_gmail import resolve_recipient_email
+
+        with patch.object(config, "USER_DEFAULT_EMAIL", "default@company.org"):
+            # Empty / self
+            self.assertEqual(resolve_recipient_email(""), "default@company.org")
+            self.assertEqual(resolve_recipient_email("me"), "default@company.org")
+            self.assertEqual(resolve_recipient_email("self"), "default@company.org")
+
+            # Placeholders
+            self.assertEqual(resolve_recipient_email("friend@example.com"), "default@company.org")
+            self.assertEqual(resolve_recipient_email("user@example.com"), "default@company.org")
+
+            # Explicit 3rd party addresses preserved
+            self.assertEqual(resolve_recipient_email("partner@example.com"), "partner@example.com")
+            self.assertEqual(resolve_recipient_email("test@example.com"), "test@example.com")
+            self.assertEqual(resolve_recipient_email("colleague@somewhere.com"), "colleague@somewhere.com")
+
+    def test_send_email_resolves_relative_attachment_path(self):
+        import config
+        from plugins.p_gmail import GmailPlugin
+
+        plugin = GmailPlugin()
+        with tempfile.TemporaryDirectory() as td:
+            fake_home = Path(td) / "fake_home"
+            fake_home.mkdir()
+            dl = fake_home / "Downloads"
+            dl.mkdir()
+            f = dl / "tree.txt"
+            f.write_text("oak and maple")
+
+            with patch("pathlib.Path.home", return_value=fake_home):
+                with patch.object(plugin, "_get_service") as mock_svc:
+                    mock_send = MagicMock()
+                    mock_svc.return_value.users.return_value.messages.return_value.send.return_value = mock_send
+
+                    res = _run(plugin.execute(
+                        to_email="test@example.com",
+                        subject="Tree File",
+                        body="Here is tree",
+                        attachment_path="Downloads/tree.txt",
+                    ))
+                    self.assertTrue(res.success)
+                    self.assertIn("Attachment:", res.output)
+                    self.assertIn("tree.txt", res.data["attachment"])
+                    self.assertIn("direct_reply", res.data)
+                    mock_send.execute.assert_called_once()
+
+    def test_send_email_directory_auto_zips(self):
+        import config
+        from plugins.p_gmail import GmailPlugin
+
+        plugin = GmailPlugin()
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td) / "wallpapers"
+            folder.mkdir()
+            (folder / "mountain.png").write_text("img")
+
+            with patch.object(plugin, "_get_service") as mock_svc:
+                mock_send = MagicMock()
+                mock_svc.return_value.users.return_value.messages.return_value.send.return_value = mock_send
+
+                res = _run(plugin.execute(
+                    to_email="test@example.com",
+                    subject="Wallpapers",
+                    body="Here are wallpapers",
+                    attachment_path=str(folder),
+                ))
+                self.assertTrue(res.success)
+                self.assertIn("wallpapers.zip", res.output)
+
+    def test_send_email_oversized_self_falls_back_to_telegram(self):
+        import config
+        from plugins.p_gmail import GmailPlugin
+
+        plugin = GmailPlugin()
+        with tempfile.TemporaryDirectory() as td:
+            doc = Path(td) / "heavy_project.dat"
+            doc.write_bytes(b"0" * 100)
+
+            with patch.object(config, "USER_DEFAULT_EMAIL", "default@company.org"):
+                with patch("os.path.getsize", return_value=35 * 1024 * 1024):
+                    res = _run(plugin.execute(
+                        to_email="me",
+                        subject="Big File",
+                        body="File body",
+                        attachment_path=str(doc),
+                    ))
+                    self.assertTrue(res.success)
+                    self.assertIn("exceeds Gmail's 25 MB limit, so I sent it here on Telegram instead", res.output)
+                    self.assertIn("send_files", res.data)
+                    self.assertEqual(len(res.data["send_files"]), 1)
+                    self.assertEqual(res.data["send_files"][0]["path"], str(doc))
+
+    def test_send_email_blocks_sensitive_file(self):
+        from plugins.p_gmail import GmailPlugin
+
+        plugin = GmailPlugin()
+        with tempfile.TemporaryDirectory() as td:
+            sec = Path(td) / "id_rsa.key"
+            sec.write_text("private")
+
+            res = _run(plugin.execute(
+                to_email="test@example.com",
+                subject="Key",
+                body="Secret",
+                attachment_path=str(sec),
+            ))
+            self.assertFalse(res.success)
+            self.assertIn("Access denied", res.output)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
