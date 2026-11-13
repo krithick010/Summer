@@ -10,11 +10,13 @@ Does NOT start with `p_` so Orchestrator ignores it during plugin auto-discovery
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import threading
 import time
 from typing import Any
@@ -34,6 +36,50 @@ from plugins.file_search import (
 log = logging.getLogger(__name__)
 
 
+class CallableBool:
+    """A boolean wrapper that can be called as a method or used as a bool."""
+
+    def __init__(self, val: bool = False) -> None:
+        self._val = bool(val)
+
+    def __call__(self) -> bool:
+        return self._val
+
+    def __bool__(self) -> bool:
+        return self._val
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, CallableBool):
+            return self._val == other._val
+        return self._val == other
+
+    def __repr__(self) -> str:
+        return str(self._val)
+
+
+def is_link_or_junction(entry: os.DirEntry, st: os.stat_result | None = None) -> bool:
+    """Return True if entry is a symlink or Windows junction / mount point.
+
+    Cloud sync placeholders (e.g. OneDrive 0x9000001A) and other reparse points are NOT skipped.
+    """
+    try:
+        if st is None:
+            st = entry.stat(follow_symlinks=False)
+        attrs = getattr(st, "st_file_attributes", None)
+        if attrs is not None:
+            reparse_attr = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+            if bool(attrs & reparse_attr):
+                tag = getattr(st, "st_reparse_tag", 0)
+                symlink_tag = getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C)
+                mount_tag = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+                if tag in (symlink_tag, mount_tag):
+                    return True
+                return False
+        return entry.is_symlink()
+    except (OSError, PermissionError):
+        return False
+
+
 def _get_default_db_path() -> Path:
     data_dir = Path(getattr(config, "DATA_DIR", "data"))
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -49,7 +95,16 @@ class FileIndexer:
         self.is_running: bool = False
         self.total_indexed: int = 0
         self.last_completed: float | None = None
+        self.last_duration: float = 0.0
         self.last_error: str | None = None
+        self.has_completed_crawl: CallableBool = CallableBool(False)
+        self.skip_counts: dict[str, int] = {
+            "excluded": 0,
+            "sensitive": 0,
+            "link_or_junction": 0,
+            "permission_error": 0,
+        }
+        self.top_folders: list[tuple[str, int]] = []
 
         self._stop_event = threading.Event()
         self._crawler_thread: threading.Thread | None = None
@@ -85,6 +140,14 @@ class FileIndexer:
                     mtime REAL,
                     is_dir INTEGER,
                     gen INTEGER
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS meta(
+                    key TEXT PRIMARY KEY,
+                    value TEXT
                 );
                 """
             )
@@ -129,12 +192,41 @@ class FileIndexer:
                 )
             conn.commit()
 
-            # Load initial count
+            # Load initial count and metadata
             row = conn.execute("SELECT count(*) FROM files").fetchone()
             if row:
                 self.total_indexed = row[0]
-                if self.total_indexed > 0:
+                meta_rows = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+                if "has_completed_crawl" in meta_rows:
+                    self.has_completed_crawl = CallableBool(meta_rows["has_completed_crawl"] == "1")
+                elif self.total_indexed > 0:
+                    self.has_completed_crawl = CallableBool(True)
+
+                if "last_completed" in meta_rows:
+                    try:
+                        self.last_completed = float(meta_rows["last_completed"])
+                    except ValueError:
+                        self.last_completed = time.time()
+                elif self.total_indexed > 0:
                     self.last_completed = time.time()
+
+                if "last_duration" in meta_rows:
+                    try:
+                        self.last_duration = float(meta_rows["last_duration"])
+                    except ValueError:
+                        pass
+
+                if "skip_counts" in meta_rows:
+                    try:
+                        self.skip_counts = json.loads(meta_rows["skip_counts"])
+                    except Exception:
+                        pass
+
+                if "top_folders" in meta_rows:
+                    try:
+                        self.top_folders = json.loads(meta_rows["top_folders"])
+                    except Exception:
+                        pass
         except Exception as exc:
             log.warning("FileIndexer DB init warning: %s", exc)
         finally:
@@ -150,7 +242,7 @@ class FileIndexer:
 
     def is_ready(self) -> bool:
         """Return True if the index contains indexed files and has completed a crawl."""
-        return self.total_indexed > 0 and self.last_completed is not None
+        return self.total_indexed > 0 and bool(self.has_completed_crawl)
 
     def crawl_sync(self, roots: list[Path] | None = None, batch_size: int = 5000) -> int:
         """Crawl target roots synchronously, batch insert, and clean up unvisited files."""
@@ -159,6 +251,15 @@ class FileIndexer:
             self.last_error = None
 
         conn = self._get_connection()
+        crawl_start = time.time()
+        skip_counts = {
+            "excluded": 0,
+            "sensitive": 0,
+            "link_or_junction": 0,
+            "permission_error": 0,
+        }
+        root_counts: dict[str, int] = {}
+
         try:
             target_roots = roots if roots is not None else roots_for_mode()
             row = conn.execute("SELECT coalesce(max(gen), 0) FROM files").fetchone()
@@ -174,7 +275,11 @@ class FileIndexer:
                     break
                 if not root_dir.exists() or not root_dir.is_dir():
                     continue
-                if is_sensitive_path(root_dir) or is_excluded_path(root_dir):
+                if is_sensitive_path(root_dir):
+                    skip_counts["sensitive"] += 1
+                    continue
+                if is_excluded_path(root_dir):
+                    skip_counts["excluded"] += 1
                     continue
 
                 stack = [root_dir]
@@ -199,27 +304,51 @@ class FileIndexer:
 
                                 name = entry.name
                                 if name.startswith(".") and name not in (".", ".."):
+                                    skip_counts["excluded"] += 1
                                     continue
 
                                 full_p = Path(entry.path)
-                                if is_reparse_point(full_p):
+
+                                try:
+                                    st = entry.stat(follow_symlinks=False)
+                                except (PermissionError, OSError):
+                                    skip_counts["permission_error"] += 1
                                     continue
+
+                                if is_link_or_junction(entry, st):
+                                    skip_counts["link_or_junction"] += 1
+                                    continue
+
                                 if is_sensitive_path(full_p):
+                                    skip_counts["sensitive"] += 1
                                     continue
+
                                 if is_excluded_path(full_p):
+                                    skip_counts["excluded"] += 1
                                     continue
 
                                 try:
                                     is_directory = entry.is_dir(follow_symlinks=False)
-                                except OSError:
+                                except (PermissionError, OSError):
+                                    skip_counts["permission_error"] += 1
                                     continue
+
+                                # Determine top-level folder name for root_counts
+                                try:
+                                    rel = full_p.relative_to(root_dir)
+                                    if len(rel.parts) > 1:
+                                        top_name = rel.parts[0]
+                                    else:
+                                        top_name = full_p.name if is_directory else (root_dir.name or str(root_dir))
+                                except Exception:
+                                    top_name = root_dir.name or str(root_dir)
 
                                 if is_directory:
                                     if _should_skip_dir(name, full_p):
+                                        skip_counts["excluded"] += 1
                                         continue
                                     stack.append(full_p)
                                     try:
-                                        st = entry.stat(follow_symlinks=False)
                                         norm_stem = " ".join(split_stem_tokens(full_p.stem))
                                         batch.append((
                                             str(full_p.resolve()),
@@ -236,7 +365,6 @@ class FileIndexer:
                                         pass
                                 else:
                                     try:
-                                        st = entry.stat(follow_symlinks=False)
                                         norm_stem = " ".join(split_stem_tokens(full_p.stem))
                                         ext = full_p.suffix.lower()
                                         batch.append((
@@ -250,6 +378,7 @@ class FileIndexer:
                                             current_gen,
                                         ))
                                         items_indexed += 1
+                                        root_counts[top_name] = root_counts.get(top_name, 0) + 1
                                     except Exception:
                                         pass
 
@@ -258,6 +387,7 @@ class FileIndexer:
                                     batch.clear()
 
                     except (PermissionError, OSError):
+                        skip_counts["permission_error"] += 1
                         continue
 
             if batch and not self._stop_event.is_set():
@@ -272,7 +402,23 @@ class FileIndexer:
                 count_row = conn.execute("SELECT count(*) FROM files").fetchone()
                 self.total_indexed = count_row[0] if count_row else items_indexed
                 self.last_completed = time.time()
-                log.info("File crawl completed. Total indexed: %d", self.total_indexed)
+                self.last_duration = round(time.time() - crawl_start, 2)
+                self.has_completed_crawl = CallableBool(True)
+                self.skip_counts = skip_counts
+                self.top_folders = sorted(root_counts.items(), key=lambda item: item[1], reverse=True)[:6]
+
+                try:
+                    conn.execute("REPLACE INTO meta (key, value) VALUES ('has_completed_crawl', '1');")
+                    conn.execute("REPLACE INTO meta (key, value) VALUES ('last_completed', ?);", (str(self.last_completed),))
+                    conn.execute("REPLACE INTO meta (key, value) VALUES ('last_duration', ?);", (str(self.last_duration),))
+                    conn.execute("REPLACE INTO meta (key, value) VALUES ('skip_counts', ?);", (json.dumps(self.skip_counts),))
+                    conn.execute("REPLACE INTO meta (key, value) VALUES ('top_folders', ?);", (json.dumps(self.top_folders),))
+                    conn.commit()
+                except Exception as meta_exc:
+                    log.warning("Failed saving crawl metadata: %s", meta_exc)
+
+                summary = self.format_status_message()
+                log.info("%s", summary)
 
             return items_indexed
 
@@ -446,26 +592,38 @@ class FileIndexer:
             "is_running": self.is_running,
             "total_indexed": self.total_indexed,
             "last_completed": self.last_completed,
+            "last_duration": self.last_duration,
             "last_error": self.last_error,
             "mode": getattr(config, "FILE_SEARCH_MODE", "home"),
             "roots": [str(r) for r in roots],
+            "top_folders": self.top_folders,
+            "skip_counts": self.skip_counts,
+            "has_completed_crawl": bool(self.has_completed_crawl),
         }
 
     def format_status_message(self) -> str:
         """Format index status for the /index Telegram command."""
         status = self.get_status()
         count = status["total_indexed"]
-        mode = status["mode"]
-        roots = roots_for_mode()
+        duration = status.get("last_duration", 0.0)
+        mode = status.get("mode", "home")
+        top_folders = status.get("top_folders", [])
+        skip = status.get("skip_counts", {
+            "excluded": 0, "sensitive": 0, "link_or_junction": 0, "permission_error": 0
+        })
 
-        # Format roots list
-        root_labels = []
-        for r in roots:
-            lbl = r.name or str(r)
-            root_labels.append(lbl)
-        roots_str = ", ".join(root_labels) if root_labels else "none"
+        if top_folders:
+            top_str = ", ".join(f"{name}: {cnt:,}" for name, cnt in top_folders[:6])
+        else:
+            top_str = "none"
 
-        # Format last crawl time
+        skip_str = (
+            f"excluded: {skip.get('excluded', 0)}, "
+            f"sensitive: {skip.get('sensitive', 0)}, "
+            f"link_or_junction: {skip.get('link_or_junction', 0)}, "
+            f"permission_error: {skip.get('permission_error', 0)}"
+        )
+
         if status["last_completed"]:
             delta = max(0.0, time.time() - status["last_completed"])
             if delta < 60:
@@ -477,7 +635,11 @@ class FileIndexer:
         else:
             time_str = "in progress" if status["is_running"] else "never"
 
-        return f"Indexed {count:,} files. Last crawl: {time_str}. Mode: {mode} ({roots_str})."
+        return (
+            f"Indexed {count:,} files. Last crawl: {time_str} (duration: {duration:.1f}s). Mode: {mode}.\n"
+            f"Top folders: {top_str}\n"
+            f"Skipped: {skip_str}"
+        )
 
 
 # Singleton instance

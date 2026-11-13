@@ -338,16 +338,26 @@ def log_file_audit(
 
 
 def is_reparse_point(path: Path | str) -> bool:
-    """Return True if path is a symlink or Windows junction / reparse point."""
+    """Return True if path is a symlink or Windows junction / mount point.
+
+    Reparse points that are cloud sync placeholders (e.g. OneDrive) are NOT skipped.
+    """
     try:
         p = Path(path)
-        if p.is_symlink():
-            return True
         st = os.lstat(str(p))
-        attrs = getattr(st, "st_file_attributes", 0)
-        reparse_attr = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
-        if bool(attrs & reparse_attr):
-            return True
+        attrs = getattr(st, "st_file_attributes", None)
+        if attrs is not None:
+            reparse_attr = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+            if bool(attrs & reparse_attr):
+                tag = getattr(st, "st_reparse_tag", 0)
+                symlink_tag = getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C)
+                mount_tag = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+                if tag in (symlink_tag, mount_tag):
+                    return True
+                if tag == 0:
+                    return p.is_symlink()
+                return False
+        return p.is_symlink()
     except Exception:
         pass
     return False
@@ -829,7 +839,7 @@ def get_search_roots() -> list[Path]:
 def _scan_tier1_fast(
     name_tokens: list[str],
     ext_filters: list[str],
-    timeout_sec: float = 1.5,
+    timeout_sec: float = 1.0,
 ) -> list[FileMatch]:
     """Perform a fast live walk of standard user folders capped at timeout_sec."""
     home = Path.home()
@@ -879,8 +889,109 @@ def _scan_tier1_fast(
     return matches
 
 
+def _scan_root(
+    root_dir: Path,
+    name_tokens: list[str],
+    ext_filters: list[str],
+    scored_matches: list[tuple[int, float, FileMatch]],
+    timeout_sec: float | None = None,
+    start_time: float | None = None,
+) -> bool:
+    """Walk root_dir and collect matches. Returns True if timed out."""
+    visited_dirs: set[Path] = set()
+    for current_root, dirs, files in os.walk(str(root_dir), onerror=lambda _: None):
+        if timeout_sec and start_time and (time.perf_counter() - start_time) > timeout_sec:
+            return True
+
+        curr_p = Path(current_root)
+        try:
+            curr_res = curr_p.resolve()
+            if curr_res in visited_dirs:
+                dirs[:] = []
+                continue
+            visited_dirs.add(curr_res)
+        except Exception:
+            pass
+
+        # Prune noisy, hidden, or sensitive directories in-place
+        dirs[:] = [
+            d for d in dirs
+            if not _should_skip_dir(d, curr_p / d)
+        ]
+
+        # Check files
+        for f in files:
+            if f.startswith("."):
+                continue
+            file_path = curr_p / f
+            if is_excluded_path(file_path) or is_sensitive_path(file_path):
+                continue
+            res = _match_candidate(file_path, name_tokens, ext_filters)
+            if res is not None:
+                score, approx = res
+                try:
+                    st = file_path.stat()
+                    scored_matches.append((score, st.st_mtime, FileMatch(path=file_path, size=st.st_size, mtime=st.st_mtime, approximate=approx)))
+                except Exception:
+                    pass
+
+    return False
+
+
+def _scan_home_wide(
+    home: Path,
+    name_tokens: list[str],
+    ext_filters: list[str],
+    searched_tier1_paths: set[str],
+    scored_matches: list[tuple[int, float, FileMatch]],
+    timeout_sec: float = 6.0,
+) -> None:
+    """Tier 2 scan: Walk rest of Path.home() capped at timeout_sec."""
+    t0 = time.perf_counter()
+    if home.exists() and home.is_dir() and not is_sensitive_path(home):
+        try:
+            for entry in home.iterdir():
+                if time.perf_counter() - t0 > timeout_sec:
+                    break
+                if not entry.is_dir():
+                    if not entry.name.startswith("."):
+                        res = _match_candidate(entry, name_tokens, ext_filters)
+                        if res is not None:
+                            score, approx = res
+                            try:
+                                st = entry.stat()
+                                scored_matches.append((score, st.st_mtime, FileMatch(path=entry, size=st.st_size, mtime=st.st_mtime, approximate=approx)))
+                            except Exception:
+                                pass
+                    continue
+
+                if _should_skip_dir(entry.name, entry) or is_sensitive_path(entry) or is_excluded_path(entry):
+                    continue
+
+                try:
+                    res_p = entry.resolve()
+                except Exception:
+                    res_p = entry
+                if str(res_p).lower() in searched_tier1_paths:
+                    continue
+
+                timed_out = _scan_root(
+                    entry,
+                    name_tokens=name_tokens,
+                    ext_filters=ext_filters,
+                    scored_matches=scored_matches,
+                    timeout_sec=timeout_sec,
+                    start_time=t0,
+                )
+                if timed_out:
+                    break
+        except Exception:
+            pass
+
+
 def search_files(query: str, file_type: str = "", max_results: int = 5) -> list[FileMatch]:
     """Find files or folders matching ``query`` returning list of FileMatch objects."""
+    t_start = time.perf_counter()
     cleaned_query = query.strip().strip('"\'')
     if not cleaned_query:
         return []
@@ -923,15 +1034,43 @@ def search_files(query: str, file_type: str = "", max_results: int = 5) -> list[
     elif mode == "all_drives":
         override_roots = roots_for_mode("all_drives")
 
-    # 2. If index is ready and no explicit root override, merge index search with fast Tier 1 live-scan
     from plugins.file_index import file_indexer  # noqa: PLC0415
-    if file_indexer.is_ready() and root_hint is None and not override_roots:
+    index_ready = bool(file_indexer.has_completed_crawl() or file_indexer.is_ready())
+
+    if index_ready:
+        t0 = time.perf_counter()
         index_matches = file_indexer.search(
             name_tokens=name_tokens,
             ext_filters=ext_filters,
             max_results=max_results * 4,
         )
-        live_matches = _scan_tier1_fast(name_tokens, ext_filters, timeout_sec=1.5)
+        if root_hint is not None:
+            try:
+                rh = root_hint.resolve()
+                index_matches = [m for m in index_matches if rh in m.path.resolve().parents or m.path.resolve() == rh]
+            except Exception:
+                pass
+        elif override_roots:
+            index_matches = [
+                m for m in index_matches
+                if any(r in m.path.resolve().parents or m.path.resolve() == r for r in override_roots)
+            ]
+        index_ms = (time.perf_counter() - t0) * 1000.0
+
+        t1 = time.perf_counter()
+        live_matches = _scan_tier1_fast(name_tokens, ext_filters, timeout_sec=1.0)
+        if root_hint is not None:
+            try:
+                rh = root_hint.resolve()
+                live_matches = [m for m in live_matches if rh in m.path.resolve().parents or m.path.resolve() == rh]
+            except Exception:
+                pass
+        elif override_roots:
+            live_matches = [
+                m for m in live_matches
+                if any(r in m.path.resolve().parents or m.path.resolve() == r for r in override_roots)
+            ]
+        live_ms = (time.perf_counter() - t1) * 1000.0
 
         seen_paths: set[Path] = set()
         merged_scored: list[tuple[int, float, FileMatch]] = []
@@ -950,62 +1089,24 @@ def search_files(query: str, file_type: str = "", max_results: int = 5) -> list[
                 merged_scored.append((score, m.mtime, FileMatch(path=m.path, size=m.size, mtime=m.mtime, approximate=approx)))
 
         merged_scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return [match for _, _, match in merged_scored[:max_results]]
+        results = [match for _, _, match in merged_scored[:max_results]]
+        total_ms = (time.perf_counter() - t_start) * 1000.0
+        log.info("search timing: index_ms=%.1f live_ms=%.1f total_ms=%.1f results=%d", index_ms, live_ms, total_ms, len(results))
+        return results
 
+    # Index has NOT completed crawl: fallback to live walk with Tier 2
+    index_ms = 0.0
+    t1 = time.perf_counter()
     home = Path.home()
     priority_subdirs = ["Desktop", "Downloads", "Documents", "Pictures", "Videos", "Music"]
-
     scored_matches: list[tuple[int, float, FileMatch]] = []
 
-    def _scan_root(root_dir: Path, timeout_sec: float | None = None, start_time: float | None = None) -> bool:
-        """Walk root_dir and collect matches. Returns True if timed out."""
-        visited_dirs: set[Path] = set()
-        for current_root, dirs, files in os.walk(str(root_dir), onerror=lambda _: None):
-            if timeout_sec and start_time and (time.perf_counter() - start_time) > timeout_sec:
-                return True
-
-            curr_p = Path(current_root)
-            try:
-                curr_res = curr_p.resolve()
-                if curr_res in visited_dirs:
-                    dirs[:] = []
-                    continue
-                visited_dirs.add(curr_res)
-            except Exception:
-                pass
-
-            # Prune noisy, hidden, or sensitive directories in-place
-            dirs[:] = [
-                d for d in dirs
-                if not _should_skip_dir(d, curr_p / d)
-            ]
-
-            # Check files
-            for f in files:
-                if f.startswith("."):
-                    continue
-                file_path = curr_p / f
-                if is_excluded_path(file_path) or is_sensitive_path(file_path):
-                    continue
-                res = _match_candidate(file_path, name_tokens, ext_filters)
-                if res is not None:
-                    score, approx = res
-                    try:
-                        st = file_path.stat()
-                        scored_matches.append((score, st.st_mtime, FileMatch(path=file_path, size=st.st_size, mtime=st.st_mtime, approximate=approx)))
-                    except Exception:
-                        pass
-
-        return False
-
-    # If root_hint is set, search only that folder
     if root_hint is not None and root_hint.exists() and root_hint.is_dir():
-        _scan_root(root_hint)
+        _scan_root(root_hint, name_tokens, ext_filters, scored_matches)
     elif override_roots:
         for r in override_roots:
-            _scan_root(r)
+            _scan_root(r, name_tokens, ext_filters, scored_matches)
     else:
-        # Tier 1 roots: Standard user folders + OneDrive mirror folders
         tier1_roots: list[Path] = []
         for d in priority_subdirs:
             p = home / d
@@ -1026,42 +1127,21 @@ def search_files(query: str, file_type: str = "", max_results: int = 5) -> list[
         searched_tier1_paths: set[str] = set()
         for root in tier1_roots:
             searched_tier1_paths.add(str(root).lower())
-            _scan_root(root)
+            _scan_root(root, name_tokens, ext_filters, scored_matches)
 
-        # If any Tier A match found, return top results immediately
+        # If any Tier A match found, do not run Tier 2
         has_tier_a = any(score >= 100 for score, _, _ in scored_matches)
         if not has_tier_a:
-            # Tier 2 scan: Rest of Path.home() with 6.0s timeout
-            t0 = time.perf_counter()
-            if home.exists() and home.is_dir() and not is_sensitive_path(home):
-                try:
-                    for entry in home.iterdir():
-                        if time.perf_counter() - t0 > 6.0:
-                            break
-                        if not entry.is_dir():
-                            if not entry.name.startswith("."):
-                                res = _match_candidate(entry, name_tokens, ext_filters)
-                                if res is not None:
-                                    score, approx = res
-                                    st = entry.stat()
-                                    scored_matches.append((score, st.st_mtime, FileMatch(path=entry, size=st.st_size, mtime=st.st_mtime, approximate=approx)))
-                            continue
+            _scan_home_wide(
+                home=home,
+                name_tokens=name_tokens,
+                ext_filters=ext_filters,
+                searched_tier1_paths=searched_tier1_paths,
+                scored_matches=scored_matches,
+                timeout_sec=6.0,
+            )
 
-                        if _should_skip_dir(entry.name, entry) or is_sensitive_path(entry) or is_excluded_path(entry):
-                            continue
-
-                        if str(entry.resolve()).lower() in searched_tier1_paths:
-                            continue
-
-                        timed_out = _scan_root(entry, timeout_sec=6.0, start_time=t0)
-                        if timed_out:
-                            break
-                except Exception:
-                    pass
-
-    # Sort matches by score descending, then mtime descending
     scored_matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
-
     seen: set[Path] = set()
     results: list[FileMatch] = []
     for _, _, match in scored_matches:
@@ -1071,6 +1151,9 @@ def search_files(query: str, file_type: str = "", max_results: int = 5) -> list[
             if len(results) >= max_results:
                 break
 
+    live_ms = (time.perf_counter() - t1) * 1000.0
+    total_ms = (time.perf_counter() - t_start) * 1000.0
+    log.info("search timing: index_ms=%.1f live_ms=%.1f total_ms=%.1f results=%d", index_ms, live_ms, total_ms, len(results))
     return results
 
 

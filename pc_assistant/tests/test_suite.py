@@ -3008,7 +3008,7 @@ class TestFileSearch(unittest.TestCase):
         with patch.object(config, "FILE_SEARCH_EXCLUDE", "secret_project,junk_folder"):
             self.assertTrue(is_excluded_path("C:\\Users\\krith\\secret_project\\doc.txt"))
             self.assertTrue(is_excluded_path("/home/user/junk_folder/test.dat"))
-            self.assertFalse(is_excluded_path("C:\\Users\\krith\\other_project\\doc.txt"))
+            self.assertFalse(is_excluded_path("C:\\Users\\testuser\\other_project\\doc.txt"))
 
     def test_symlink_or_junction_loop_avoidance(self):
         import config
@@ -4010,6 +4010,185 @@ class TestFileIndex(unittest.TestCase):
                         _run(main.cmd_reindex(mock_update, mock_context))
                         mock_reindex.assert_called_once()
                         mock_update.message.reply_text.assert_called_with("Reindex started.")
+
+
+class TestPhase1FileIndex(unittest.TestCase):
+    """Hermetic unit tests for Phase 1: cloud placeholders, diagnostics, skip counters, no slow walks."""
+
+    def test_reparse_junction_skipped_and_cloud_placeholder_indexed(self):
+        from plugins.file_index import FileIndexer, is_link_or_junction
+
+        fake_stat_junction = MagicMock()
+        fake_stat_junction.st_file_attributes = 0x400
+        fake_stat_junction.st_reparse_tag = 0xA0000003  # Mount point / junction
+        entry_junction = MagicMock()
+        entry_junction.is_symlink.return_value = False
+        entry_junction.stat.return_value = fake_stat_junction
+
+        fake_stat_cloud = MagicMock()
+        fake_stat_cloud.st_file_attributes = 0x400
+        fake_stat_cloud.st_reparse_tag = 0x9000001A  # Cloud placeholder (OneDrive)
+        fake_stat_cloud.st_size = 1234
+        fake_stat_cloud.st_mtime = 1700000000.0
+        entry_cloud = MagicMock()
+        entry_cloud.is_symlink.return_value = False
+        entry_cloud.stat.return_value = fake_stat_cloud
+
+        self.assertTrue(is_link_or_junction(entry_junction, fake_stat_junction))
+        self.assertFalse(is_link_or_junction(entry_cloud, fake_stat_cloud))
+
+        # Test during crawl_sync: junction skipped, cloud placeholder indexed
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db_path = base / "index.db"
+            indexer = FileIndexer(db_path=db_path)
+
+            file_normal = base / "cloud_file.docx"
+            file_normal.write_text("dummy")
+
+            class MockScandirContext:
+                def __init__(self, entries):
+                    self._entries = entries
+                def __enter__(self):
+                    return iter(self._entries)
+                def __exit__(self, *args):
+                    pass
+
+            def mock_scandir(path_str):
+                fake_cloud_entry = MagicMock()
+                fake_cloud_entry.name = "cloud_file.docx"
+                fake_cloud_entry.path = str(file_normal)
+                fake_cloud_entry.is_symlink.return_value = False
+                fake_cloud_entry.stat.return_value = fake_stat_cloud
+                fake_cloud_entry.is_dir.return_value = False
+
+                fake_junction_entry = MagicMock()
+                fake_junction_entry.name = "fake_junction"
+                fake_junction_entry.path = str(base / "fake_junction")
+                fake_junction_entry.is_symlink.return_value = False
+                fake_junction_entry.stat.return_value = fake_stat_junction
+                fake_junction_entry.is_dir.return_value = True
+
+                return MockScandirContext([fake_cloud_entry, fake_junction_entry])
+
+            with patch("os.scandir", side_effect=mock_scandir):
+                indexed_count = indexer.crawl_sync(roots=[base])
+
+            self.assertEqual(indexed_count, 1)
+            self.assertEqual(indexer.skip_counts["link_or_junction"], 1)
+
+    def test_skip_counters_increment_for_each_reason(self):
+        from plugins.file_index import FileIndexer
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db_path = base / "index.db"
+            indexer = FileIndexer(db_path=db_path)
+
+            # Excluded: .hidden_dotfile and node_modules folder
+            (base / ".hidden_dotfile").write_text("hidden")
+            nm = base / "node_modules"
+            nm.mkdir()
+            (nm / "dep.js").write_text("js")
+
+            # Sensitive: server.key
+            (base / "server.key").write_text("secret_key")
+
+            # Link or junction
+            fake_stat_junction = MagicMock()
+            fake_stat_junction.st_file_attributes = 0x400
+            fake_stat_junction.st_reparse_tag = 0xA0000003
+
+            # Permission error: simulated subdirectory
+            perm_dir = base / "locked_dir"
+            perm_dir.mkdir()
+
+            orig_scandir = os.scandir
+
+            class MockScandirContext:
+                def __init__(self, entries):
+                    self._entries = entries
+                def __enter__(self):
+                    return iter(self._entries)
+                def __exit__(self, *args):
+                    pass
+
+            def mock_scandir(path_str):
+                p = Path(path_str)
+                if p.name == "locked_dir":
+                    raise PermissionError("Access denied")
+                with orig_scandir(path_str) as it:
+                    entries = list(it)
+                if p == base:
+                    fake_j = MagicMock()
+                    fake_j.name = "symlink_dir"
+                    fake_j.path = str(base / "symlink_dir")
+                    fake_j.is_symlink.return_value = False
+                    fake_j.stat.return_value = fake_stat_junction
+                    fake_j.is_dir.return_value = True
+                    entries.append(fake_j)
+                return MockScandirContext(entries)
+
+            with patch("os.scandir", side_effect=mock_scandir):
+                indexer.crawl_sync(roots=[base])
+
+            self.assertGreaterEqual(indexer.skip_counts["excluded"], 1)
+            self.assertGreaterEqual(indexer.skip_counts["sensitive"], 1)
+            self.assertGreaterEqual(indexer.skip_counts["link_or_junction"], 1)
+            self.assertGreaterEqual(indexer.skip_counts["permission_error"], 1)
+
+    def test_index_reply_text_contains_per_root_counts_and_skip_counts(self):
+        from plugins.file_index import FileIndexer
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db_path = base / "index.db"
+            indexer = FileIndexer(db_path=db_path)
+
+            doc_dir = base / "Documents"
+            doc_dir.mkdir()
+            (doc_dir / "paper1.pdf").write_text("p1")
+            (doc_dir / "paper2.pdf").write_text("p2")
+
+            dl_dir = base / "Downloads"
+            dl_dir.mkdir()
+            (dl_dir / "archive.zip").write_text("zip")
+
+            indexer.crawl_sync(roots=[base])
+            msg = indexer.format_status_message()
+
+            self.assertIn("Documents: 2", msg)
+            self.assertIn("Downloads: 1", msg)
+            self.assertIn("duration:", msg)
+            self.assertIn("Skipped: excluded: 0, sensitive: 0, link_or_junction: 0, permission_error: 0", msg)
+
+    def test_tier2_walk_not_called_when_index_is_ready(self):
+        from plugins.file_index import CallableBool, FileIndexer
+        from plugins.file_search import search_files
+
+        mock_indexer = MagicMock(spec=FileIndexer)
+        mock_indexer.has_completed_crawl = CallableBool(True)
+        mock_indexer.is_ready.return_value = True
+        mock_indexer.search.return_value = []
+
+        with patch("plugins.file_index.file_indexer", mock_indexer):
+            with patch("plugins.file_search._scan_tier1_fast", return_value=[]):
+                with patch("plugins.file_search._scan_home_wide") as mock_home_wide:
+                    matches = search_files("nonexistent_rare_file_query")
+                    self.assertEqual(matches, [])
+                    # Verify Tier 2 walk is NOT called
+                    mock_home_wide.assert_not_called()
+
+        # Conversely, verify Tier 2 walk IS called when index has not completed
+        mock_indexer_unready = MagicMock(spec=FileIndexer)
+        mock_indexer_unready.has_completed_crawl = CallableBool(False)
+        mock_indexer_unready.is_ready.return_value = False
+
+        with patch("plugins.file_index.file_indexer", mock_indexer_unready):
+            with patch("plugins.file_search._scan_root"):
+                with patch("plugins.file_search._scan_home_wide") as mock_home_wide:
+                    search_files("nonexistent_rare_file_query")
+                    mock_home_wide.assert_called_once()
 
 
 class TestListFolder(unittest.TestCase):
