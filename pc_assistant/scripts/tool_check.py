@@ -101,6 +101,10 @@ def _build_multi_turn_scenarios() -> list[tuple[str, list[EvalCase]]]:
 
 def _build_file_eval_cases() -> list[EvalCase]:
     return [
+        EvalCase("what's in my downloads folder", "list_folder"),
+        EvalCase("list my D drive", "list_folder"),
+        EvalCase("find my aadhaar scan", "find_files"),
+        EvalCase("send me the quarterly report", "find_files"),
         EvalCase("send me my aicte final file", "find_files"),
         EvalCase("where is the hangover movie", "find_files"),
         EvalCase("find my resume pdf", "find_files"),
@@ -160,6 +164,14 @@ def _stub_orchestrator_plugins(orch: Any, recorded_calls: list[tuple[str, dict[s
         except Exception:
             pass
 
+    if "list_folder" not in orch.registry:
+        try:
+            from plugins.p_folder import ListFolderPlugin
+
+            orch.registry["list_folder"] = ListFolderPlugin()
+        except Exception:
+            pass
+
     for tool_name, plugin in orch.registry.items():
         async def _stub_execute(
             _tool: str = tool_name, **kwargs: Any
@@ -192,6 +204,16 @@ def _stub_orchestrator_plugins(orch: Any, recorded_calls: list[tuple[str, dict[s
             elif _tool == "share_file":
                 out = f"Sent: {Path(kwargs.get('path', 'file')).name} via {kwargs.get('delivery', 'Telegram')}."
                 return PluginResult(success=True, output=out, data={"direct_reply": out})
+            elif _tool == "list_folder":
+                out = f"📂 {kwargs.get('path') or 'Roots'}\n📁 Sub\n📄 file.txt (1.0 MB)\n\nTap a folder to browse."
+                return PluginResult(
+                    success=True,
+                    output=out,
+                    data={
+                        "direct_reply": out,
+                        "choices": [{"label": "📁 Sub", "tool": "list_folder", "kwargs": {"path": "C:/fake/Sub"}}],
+                    },
+                )
             else:
                 out = f"Stub {_tool} result."
             return PluginResult(success=True, output=out)

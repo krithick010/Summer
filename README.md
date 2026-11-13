@@ -190,22 +190,38 @@ HISTORY_DB_PATH=:memory:
 | `SERVER_HOST` | `0.0.0.0` | Host interface for FastAPI server |
 | `SERVER_PORT` | `8000` | Port for FastAPI server |
 | `WEBHOOK_URL` | *(empty)* | Optional public URL for Telegram webhook mode |
+| `FILE_SEARCH_MODE` | `home` | Search mode: `home`, `all_drives`, or `custom` |
+| `FILE_SEARCH_ROOTS` | *(empty)* | Comma-separated root paths for `custom` search mode |
+| `FILE_SEARCH_EXCLUDE` | *(empty)* | Comma-separated additional paths or folders to exclude |
+| `FILE_INDEX_REFRESH_HOURS` | `6` | Hours between background file index re-crawls |
+| `FILE_INDEX_REMOVABLE` | `false` | Whether removable USB drives are included in index |
+| `FILE_MAX_SHARES_PER_HOUR` | `20` | Rolling hourly file sharing limit per user |
+| `FILE_AUDIT_LOG` | `true` | Whether file shares/access are logged to `data/file_audit.log` |
+| `FILE_TELEGRAM_MAX_MB` | `50.0` | Max file size in MB sent directly via Telegram |
+| `FILE_MAX_SPLIT_MB` | `150.0` | Max file size in MB eligible for multi-part chunking |
+| `FILE_UPLOAD_TIMEOUT_S` | `600.0` | Upload timeout in seconds for Telegram files |
+| `USER_DEFAULT_EMAIL` | *(empty)* | Default recipient email when routing files via email |
 
 ---
 
 ## 🔒 Security
 
 - **Fail-Closed Allowlist**: If `ALLOWED_USER_IDS` is empty or unset, the bot ignores all incoming messages, commands, and callbacks. Unauthorized users receive an access-denied message.
-- **Human-in-the-Loop Safeguards**: Actions that send emails or make state changes require explicit interactive button confirmation before execution.
+- **Human-in-the-Loop Safeguards**: Actions that send emails, send files, or make state changes require explicit interactive button confirmation before execution.
+- **Sensitive-Path Denylist v2**: File search and browsing strictly block credentials (SSH, AWS, gcloud), crypto wallets, browser profiles (Chrome, Edge, Firefox, Brave), OS security files, and Summer's own secrets (`.env*`, `credentials/`, `data/`).
+- **File Audit Logging & Rate Limiting**: All file share actions and cancellations append to `data/file_audit.log`. Users are limited to `FILE_MAX_SHARES_PER_HOUR` (default 20/hr).
 - **Local Storage**: Memory embeddings and chat histories are stored locally under `data/` in plain text / SQLite. Ensure appropriate filesystem permissions on your PC.
 - **Secrets Management**: Never commit `.env` or files inside `credentials/`. Both are included in `.gitignore`.
 - **Token Rotation**: If your Telegram bot token is ever exposed, revoke and regenerate it immediately via [@BotFather](https://t.me/BotFather).
 
 ---
 
-## 📁 File Sharing & Delivery Limits
+## 📁 File Access, Search & Delivery
 
-Summer allows searching and sending local files via Telegram or email:
+Summer gives you fast, controlled, read-only access to files on your computer:
+- **Interactive Button Browser (`list_folder`)**: Browse folders with inline Telegram buttons (8 items per page, directories first, files newest first). Tap `⬆ Up` to go to parent folder, `➡ More` to paginate next items inline, or tap a file to initiate sending.
+- **Background FTS5 Index (`find_files`)**: Background worker crawls files and stores metadata in `data/file_index.db` using SQLite FTS5 for sub-millisecond search across drives, combined with a quick live scan of Tier 1 user folders.
+- **Management Commands**: Send `/index` to view index status (total files, mode, roots, last crawl) or `/reindex` to trigger an immediate background re-crawl.
 - **Telegram Bot API Limit**: Standard Telegram bots can upload files up to **50 MB** per request. For files exceeding 50 MB (up to 150 MB), Summer automatically splits them into sequential 45 MB chunks with rejoining instructions.
 - **Local Bot API Server Note**: Standard cloud Telegram servers enforce the 50 MB file upload limit. Running a self-hosted [local Telegram Bot API server](https://core.telegram.org/bots/api#using-a-local-bot-api-server) lifts this limit up to 2,000 MB (2 GB).
 - **Email Route**: Files can also be sent as attachments via Gmail (subject to Gmail's 25 MB limit).

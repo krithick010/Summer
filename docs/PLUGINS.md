@@ -92,4 +92,26 @@ Plugins can pass structured instructions back to the orchestrator and UI via the
 - **`direct_reply`** (`str`): If a turn's only tool call returns this, the orchestrator uses it verbatim as the reply, records it as the assistant message in history, and does **NOT** make the follow-up model call.
 - **`choices`** (`list[dict]`): A list of interactive options structured as `[{"label": str, "tool": str, "kwargs": dict}]`. When present, the orchestrator registers them with `ChoiceStore` and returns a `ChoicesReply`, rendered in Telegram as an inline keyboard. Tapping an option triggers the corresponding tool (or its HITL approval flow if required).
 
+---
+
+## 6. File Access & Interactive Browser (`plugins/p_folder.py`, `plugins/p_files.py`)
+
+Summer provides controlled, fast, read-only file search and interactive folder browsing:
+
+- **Interactive Folder Browser (`list_folder`)**:
+  - `requires_approval = False` (read-only browsing).
+  - Paginates folder contents at 8 items per page with directories first (alphabetical) and files (newest first).
+  - Navigation controls: `⬆ Up` navigates to parent directory; `➡ More` loads the next 8 items inline by editing the Telegram message.
+  - Tapping a directory button executes `list_folder` inline without approval; tapping a file button routes to `share_file` which triggers HITL approval.
+- **Fast Search & Background Index (`find_files`, `file_index.py`)**:
+  - Background crawler indexes filenames and metadata into SQLite (`data/file_index.db`) using an FTS5 full-text virtual table with automatic sync triggers.
+  - Combines instant FTS5 match results with a fast live scan (capped at 1.5s) over Tier 1 directories (Desktop, Downloads, Documents) for files created between crawl cycles.
+  - Manageable via Telegram commands: `/index` shows current status (indexed count, mode, roots, last crawl); `/reindex` triggers an immediate background recrawl.
+- **Delivery & Security Boundaries (`share_file`, `file_search.py`)**:
+  - `requires_approval = True` (HITL gated).
+  - **Sensitive-Path Denylist v2**: Hard-blocks SSH keys, cloud credentials (`.aws`, `gcloud`), cryptocurrency wallets (`wallet.dat`), browser profiles (Chrome, Edge, Firefox, Brave), OS secrets (`/etc/shadow`), and Summer's own secrets (`.env*`, `credentials/`, `data/`).
+  - **Soft Warnings**: If a requested file has sensitive keywords (e.g. `salary`, `tax`, `statement`, `aadhaar`) or is outside standard user folders, preview shows a warning before approval.
+  - **Audit Log & Rate Limiting**: All file shares and cancellations append to `data/file_audit.log`. A rolling rate limiter enforces a default cap of 20 shares per hour (`FILE_MAX_SHARES_PER_HOUR`).
+
+
 
