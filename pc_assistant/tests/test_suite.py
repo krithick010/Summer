@@ -4538,5 +4538,75 @@ class TestPhase3SmartEmailResolution(unittest.TestCase):
             self.assertIn("Access denied", res.output)
 
 
+class TestPhase4TelegramAwarenessAndNoDoubleReply(unittest.TestCase):
+    """Test Telegram self-awareness in prompt and no double-reply on HITL approval."""
+
+    def test_system_prompt_contains_telegram_awareness(self):
+        from core.orchestrator import build_system_prompt
+        prompt = build_system_prompt()
+        self.assertIn("directly inside Telegram right now", prompt)
+        self.assertIn("The file will be sent right here in this Telegram chat", prompt)
+
+    def test_hitl_approval_with_direct_reply_skips_resume_tool_loop(self):
+        import main
+        from core.orchestrator import Orchestrator
+        from core.state_manager import StateManager
+        from plugins.base import PluginBase, PluginResult
+
+        class DummySharePlugin(PluginBase):
+            name = "dummy_share"
+            description = "Dummy share plugin"
+            requires_approval = True
+            async def execute(self, **kwargs):
+                return PluginResult(
+                    success=True,
+                    output="File sent successfully",
+                    data={"direct_reply": "Sent: photo.jpg via Telegram."},
+                )
+
+        sm = StateManager()
+        orch = Orchestrator(llm=MagicMock(), state_manager=sm)
+        orch.registry["dummy_share"] = DummySharePlugin()
+        orch.resume_tool_loop = AsyncMock()
+
+        orig_orch = main._orchestrator
+        main._orchestrator = orch
+
+        try:
+            # Setup realistic history before approval
+            orch.history.add(99, "user", "send photo.jpg")
+            orch.history.add(99, {"role": "assistant", "tool_calls": [{"id": "call_1", "function": {"name": "dummy_share"}}]})
+
+            action = sm.create_action("dummy_share", {}, "desc", user_id=99)
+            approval_id = action.approval_id
+
+            mock_update = MagicMock()
+            mock_update.callback_query.data = f"hitl:approve:{approval_id}"
+            mock_update.callback_query.from_user.id = 99
+            mock_update.callback_query.answer = AsyncMock()
+            mock_update.callback_query.edit_message_text = AsyncMock()
+            mock_update.callback_query.message.chat_id = 12345
+
+            mock_context = MagicMock()
+            mock_context.bot.send_message = AsyncMock()
+
+            with patch("main._is_allowed", return_value=True):
+                _run(main.handle_callback_query(mock_update, mock_context))
+
+            # 1. resume_tool_loop must NOT be called
+            orch.resume_tool_loop.assert_not_called()
+
+            # 2. History must contain the direct_reply
+            hist = orch.history.get(99)
+            assistant_replies = [m.get("content") for m in hist if m.get("role") == "assistant"]
+            self.assertIn("Sent: photo.jpg via Telegram.", assistant_replies)
+
+            # 3. Message sent to user
+            mock_context.bot.send_message.assert_called_once()
+            self.assertEqual(mock_context.bot.send_message.call_args.kwargs["text"], "Sent: photo.jpg via Telegram.")
+        finally:
+            main._orchestrator = orig_orch
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

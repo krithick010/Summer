@@ -557,14 +557,19 @@ async def handle_callback_query(
                 # 4. Use direct_reply if present, else resume the LLM conversational loop
                 if (
                     result
-                    and result.success
                     and isinstance(result.data, dict)
-                    and "direct_reply" in result.data
+                    and result.data.get("direct_reply")
                 ):
                     final_text = str(result.data["direct_reply"])
                     _orchestrator.history.add(user_id, "assistant", final_text)
-                else:
-                    final_text = await _orchestrator.resume_tool_loop(user_id)
+                    await _safe_send_message(
+                        context.bot,
+                        chat_id=query.message.chat_id,
+                        text=final_text,
+                    )
+                    return
+
+                final_text = await _orchestrator.resume_tool_loop(user_id)
             else:
                 final_text = (
                     str(result.data["direct_reply"])
