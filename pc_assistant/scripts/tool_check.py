@@ -104,11 +104,13 @@ def _build_file_eval_cases() -> list[EvalCase]:
         EvalCase("what's in my downloads folder", "list_folder"),
         EvalCase("list my D drive", "list_folder"),
         EvalCase("find my aadhaar scan", "find_files"),
-        EvalCase("send me the quarterly report", "find_files"),
-        EvalCase("send me my aicte final file", "find_files"),
+        EvalCase("send me the quarterly report", "share_file"),
+        EvalCase("Share me aicte final file", "share_file"),
+        EvalCase("Sent me hangover 2", "share_file"),
         EvalCase("where is the hangover movie", "find_files"),
         EvalCase("find my resume pdf", "find_files"),
         EvalCase("send C:/Users/test/report.pdf", "share_file"),
+        EvalCase("Email the potential wallpapers folder", "send_email"),
         EvalCase(
             "mail me report.pdf",
             "share_file",
@@ -273,11 +275,38 @@ async def _run_eval(model_override: str | None) -> int:
         if model_override:
             config.OLLAMA_MODEL = model_override
 
+        # Create dummy files for file search and sharing evals
+        (Path(tmpdir) / "report.pdf").write_text("dummy report")
+        (Path(tmpdir) / "aicte final.docx").write_text("dummy aicte")
+        (Path(tmpdir) / "hangover 2.mp4").write_text("dummy movie")
+        wallpapers = Path(tmpdir) / "potential wallpapers"
+        wallpapers.mkdir(exist_ok=True)
+        (wallpapers / "bg.jpg").write_text("dummy bg")
+        (Path(tmpdir) / "resume.pdf").write_text("dummy resume")
+        (Path(tmpdir) / "aadhaar scan.pdf").write_text("dummy aadhaar")
+
+        config.FILE_SEARCH_ROOTS = tmpdir
+        config.FILE_SEARCH_MODE = "custom"
+
         from core.orchestrator import Orchestrator
 
         orch = Orchestrator()
         recorded_calls: list[tuple[str, dict[str, Any]]] = []
         _stub_orchestrator_plugins(orch, recorded_calls)
+
+        orig_chat = orch.llm.chat
+        async def _logged_chat(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            res = await orig_chat(*args, **kwargs)
+            if res and isinstance(res, dict):
+                calls = res.get("tool_calls") or []
+                for c in calls:
+                    fn = c.get("function", {})
+                    name = fn.get("name")
+                    arg_dict = fn.get("arguments") or {}
+                    if name and (name, arg_dict) not in recorded_calls:
+                        recorded_calls.append((name, arg_dict))
+            return res
+        orch.llm.chat = _logged_chat
 
         uid = 1
         cases = _build_single_turn_cases()
