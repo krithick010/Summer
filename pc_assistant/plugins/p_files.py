@@ -63,7 +63,7 @@ class FindFilesPlugin(PluginBase):
     requires_approval = False
 
     async def execute(self, **kwargs: Any) -> PluginResult:
-        query = str(kwargs.get("query", "")).strip()
+        query = str(kwargs.get("query") or kwargs.get("path") or "").strip()
 
         if not query:
             return PluginResult(

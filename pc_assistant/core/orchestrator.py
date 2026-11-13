@@ -313,6 +313,8 @@ class Orchestrator:
 
                     allowed = plugin.parameters_schema.get("properties", {})
                     filtered_args = {k: v for k, v in call_args.items() if k in allowed} if allowed else {}
+                    if name == "find_files" and "query" not in filtered_args and "path" in call_args:
+                        filtered_args["query"] = call_args["path"]
 
                     if plugin.requires_approval:
                         self.history.add(user_id, "user", message)

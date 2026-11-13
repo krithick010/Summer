@@ -43,6 +43,9 @@ os.environ["AI_NEWS_URLS"] = (
     "https://venturebeat.com/category/ai/"
 )
 os.environ["LLM_THINK"] = ""
+os.environ["FILE_SEARCH_MODE"] = "home"
+os.environ["FILE_SEARCH_ROOTS"] = ""
+os.environ["FILE_SEARCH_EXCLUDE"] = ""
 
 # ---------------------------------------------------------------------------
 # Silence noisy third-party warnings so test output stays readable
@@ -4168,6 +4171,78 @@ class TestListFolder(unittest.TestCase):
                     mock_orch.request_tool_approval.assert_not_called()
                 finally:
                     main._orchestrator = orig_orch
+
+
+class TestPhase1FolderAliases(unittest.TestCase):
+    """Test resolve_user_path and list_folder drive/alias resolution."""
+
+    def test_folder_aliases_and_hallucinated_user_paths(self):
+        from plugins.file_search import resolve_user_path
+
+        with tempfile.TemporaryDirectory() as td:
+            fake_home = Path(td) / "fake_home"
+            fake_home.mkdir()
+            dl = fake_home / "Downloads"
+            dl.mkdir()
+            report = dl / "report.txt"
+            report.write_text("my report")
+
+            with patch("pathlib.Path.home", return_value=fake_home):
+                # 1. Direct folder alias "Downloads"
+                p1 = resolve_user_path("Downloads")
+                self.assertIsNotNone(p1)
+                self.assertEqual(p1.resolve(), dl.resolve())
+
+                # 2. Lowercase / user-prefixed "user/downloads"
+                p2 = resolve_user_path("user/downloads")
+                self.assertIsNotNone(p2)
+                self.assertEqual(p2.resolve(), dl.resolve())
+
+                # 3. "friend/downloads"
+                p3 = resolve_user_path("friend/downloads")
+                self.assertIsNotNone(p3)
+                self.assertEqual(p3.resolve(), dl.resolve())
+
+                # 4. Relative path "Downloads/report.txt"
+                p4 = resolve_user_path("Downloads/report.txt")
+                self.assertIsNotNone(p4)
+                self.assertEqual(p4.resolve(), report.resolve())
+
+                # 5. Hallucinated Windows path "C:\\Users\\friend\\Downloads\\report.txt"
+                p5 = resolve_user_path(r"C:\Users\friend\Downloads\report.txt")
+                self.assertIsNotNone(p5)
+                self.assertEqual(p5.resolve(), report.resolve())
+
+                # 6. Non-existent path returns None
+                self.assertIsNone(resolve_user_path("NonExistentFolder12345"))
+
+    def test_missing_drive_reports_available_roots(self):
+        from plugins.p_folder import ListFolderPlugin
+
+        plugin = ListFolderPlugin()
+        with tempfile.TemporaryDirectory() as td:
+            r1 = Path(td) / "DiskC"
+            r1.mkdir()
+            with patch("plugins.p_folder.roots_for_mode", return_value=[r1]):
+                res = _run(plugin.execute(path="Z:/"))
+                self.assertFalse(res.success)
+                self.assertIn("Drive Z: was not found", res.output)
+                self.assertIn("Available roots:", res.output)
+                self.assertIn(r1.name, res.output)
+                self.assertEqual(res.data["choices"], [])
+
+    def test_find_files_accepts_path_alias(self):
+        import config
+        from plugins.p_files import FindFilesPlugin
+
+        plugin = FindFilesPlugin()
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "target.pdf"
+            f.write_text("data")
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                res = _run(plugin.execute(path="target.pdf"))
+                self.assertTrue(res.success)
+                self.assertIn("target.pdf", res.output)
 
 
 if __name__ == "__main__":

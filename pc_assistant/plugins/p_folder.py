@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+import re
 from typing import Any
 
 from plugins.base import PluginBase, PluginResult
@@ -21,6 +22,7 @@ from plugins.file_search import (
     is_excluded_path,
     is_reparse_point,
     is_sensitive_path,
+    resolve_user_path,
     roots_for_mode,
 )
 
@@ -108,16 +110,36 @@ class ListFolderPlugin(PluginBase):
             )
 
         # Case 2: Target folder listing
-        try:
-            target = Path(raw_path).resolve()
-        except Exception as exc:
-            err_msg = f"Invalid path: {raw_path}"
-            return PluginResult(
-                success=False,
-                output=err_msg,
-                data={"direct_reply": err_msg, "choices": []},
-                error=str(exc),
-            )
+        clean_input = raw_path.strip()
+
+        # Check if user asked for a drive root that does not exist (e.g. "D:/", "D:\", "D:", "Z:/", "D drive")
+        drive_match = re.match(r"^([a-zA-Z]):[/\\]*$", clean_input) or re.match(r"^([a-zA-Z])\s*drive$", clean_input, re.I)
+        if drive_match:
+            drive_letter = drive_match.group(1).upper()
+            target_drive = Path(f"{drive_letter}:/")
+            if not target_drive.exists():
+                available = ", ".join(r.name or str(r) for r in roots_for_mode())
+                msg = f"Drive {drive_letter}: was not found. Available roots: {available}."
+                return PluginResult(
+                    success=False,
+                    output=msg,
+                    data={"direct_reply": msg, "choices": []},
+                )
+
+        resolved = resolve_user_path(clean_input)
+        if resolved is not None and resolved.exists():
+            target = resolved
+        else:
+            try:
+                target = Path(clean_input).resolve()
+            except Exception as exc:
+                err_msg = f"Invalid path: {clean_input}"
+                return PluginResult(
+                    success=False,
+                    output=err_msg,
+                    data={"direct_reply": err_msg, "choices": []},
+                    error=str(exc),
+                )
 
         if not target.exists():
             msg = f"Folder not found: {raw_path}"

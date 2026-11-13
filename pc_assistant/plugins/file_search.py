@@ -431,6 +431,111 @@ def is_excluded_path(path: Path | str) -> bool:
     return False
 
 
+KNOWN_USER_FOLDERS: dict[str, str] = {
+    "downloads": "Downloads",
+    "desktop": "Desktop",
+    "documents": "Documents",
+    "pictures": "Pictures",
+    "videos": "Videos",
+    "music": "Music",
+}
+
+
+def resolve_user_path(raw_path: str) -> Path | None:
+    """Resolve user-supplied or LLM-hallucinated paths into an existing local Path.
+
+    Handles:
+    - Quoted paths, ~, environment variables
+    - Known folder aliases ("Downloads", "desktop", "friend/downloads", "user/documents")
+    - Hallucinated username prefixes (e.g. "C:\\Users\\friend\\Downloads\\report.txt")
+    - Relative paths under known folders ("Downloads/tree.txt")
+    Returns resolved Path if it exists and is not sensitive, else None.
+    """
+    if not raw_path or not str(raw_path).strip():
+        return None
+
+    raw = str(raw_path).strip().strip("'\"").strip()
+    if not raw:
+        return None
+
+    expanded = os.path.expandvars(os.path.expanduser(raw))
+    norm = expanded.replace("\\", "/")
+
+    home = Path.home()
+
+    def _find_onedrive_folder(folder_name: str, tail: Path | None = None) -> Path | None:
+        cands = [home / "OneDrive" / folder_name]
+        try:
+            for d in home.iterdir():
+                if d.is_dir() and d.name.lower().startswith("onedrive"):
+                    cands.append(d / folder_name)
+        except Exception:
+            pass
+        for c in cands:
+            cand = c / tail if tail else c
+            if cand.exists() and not is_sensitive_path(cand):
+                return cand.resolve()
+        return None
+
+    # 1. Directly a known folder alias or ends with /<folder_name>
+    clean_tail = norm.strip("/").lower()
+    parts = [p for p in clean_tail.split("/") if p]
+    if parts:
+        last_seg = parts[-1]
+        if last_seg in KNOWN_USER_FOLDERS:
+            folder_name = KNOWN_USER_FOLDERS[last_seg]
+            cand = home / folder_name
+            if cand.exists() and not is_sensitive_path(cand):
+                return cand.resolve()
+            od_cand = _find_onedrive_folder(folder_name)
+            if od_cand is not None:
+                return od_cand
+
+    # 2. Any segment is a known user folder with a relative tail
+    if parts:
+        for idx, seg in enumerate(parts):
+            if seg in KNOWN_USER_FOLDERS:
+                folder_name = KNOWN_USER_FOLDERS[seg]
+                rel_tail_parts = parts[idx + 1:]
+                if rel_tail_parts:
+                    orig_parts = [p for p in norm.strip("/").split("/") if p]
+                    tail = Path(*orig_parts[idx + 1:])
+                    cand = home / folder_name / tail
+                    if cand.exists() and not is_sensitive_path(cand):
+                        return cand.resolve()
+                    od_cand = _find_onedrive_folder(folder_name, tail)
+                    if od_cand is not None:
+                        return od_cand
+
+    # 3. Rewrite hallucinated Users\<wrong_user>\... to Path.home()
+    m = re.search(r"(?:^|[/\\])[uU]sers[/\\][^/\\]+[/\\](?P<rest>.+)$", norm)
+    if m:
+        rest = m.group("rest")
+        cand = home / Path(rest)
+        if cand.exists() and not is_sensitive_path(cand):
+            return cand.resolve()
+        rest_parts = [p for p in rest.split("/") if p]
+        if rest_parts and rest_parts[0].lower() in KNOWN_USER_FOLDERS:
+            folder_name = KNOWN_USER_FOLDERS[rest_parts[0].lower()]
+            tail = Path(*rest_parts[1:]) if len(rest_parts) > 1 else None
+            od_cand = _find_onedrive_folder(folder_name, tail)
+            if od_cand is not None:
+                return od_cand
+
+    # 4. Direct path check
+    try:
+        p = Path(expanded)
+        if p.exists() and not is_sensitive_path(p):
+            return p.resolve()
+        p_home = home / Path(norm.lstrip("/"))
+        if p_home.exists() and not is_sensitive_path(p_home):
+            return p_home.resolve()
+    except Exception:
+        pass
+
+    return None
+
+
 def roots_for_mode(mode: str | None = None) -> list[Path]:
     """Return root search paths based on mode ('home', 'all_drives', or 'custom')."""
     active_mode = (mode or getattr(config, "FILE_SEARCH_MODE", "home")).strip().lower()
@@ -808,7 +913,7 @@ def search_files(query: str, file_type: str = "", max_results: int = 5) -> list[
     # Determine search roots
     mode = getattr(config, "FILE_SEARCH_MODE", "home").strip().lower()
     override_roots: list[Path] = []
-    if mode == "custom" or (mode == "home" and config.FILE_SEARCH_ROOTS):
+    if config.FILE_SEARCH_ROOTS or mode == "custom":
         for r in (config.FILE_SEARCH_ROOTS or "").split(","):
             r_str = r.strip()
             if r_str:
