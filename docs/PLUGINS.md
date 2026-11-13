@@ -113,5 +113,27 @@ Summer provides controlled, fast, read-only file search and interactive folder b
   - **Soft Warnings**: If a requested file has sensitive keywords (e.g. `salary`, `tax`, `statement`, `aadhaar`) or is outside standard user folders, preview shows a warning before approval.
   - **Audit Log & Rate Limiting**: All file shares and cancellations append to `data/file_audit.log`. A rolling rate limiter enforces a default cap of 20 shares per hour (`FILE_MAX_SHARES_PER_HOUR`).
 
+---
+
+## 7. Deterministic Intent Routing (`PluginBase.match_intent`)
+
+Plugins can bypass the LLM for high-frequency or deterministic actions by implementing the optional `match_intent` hook:
+
+```python
+from plugins.base import PluginBase, IntentContext, RoutedCall
+
+class MyPlugin(PluginBase):
+    name = "my_tool"
+
+    def match_intent(self, message: str, ctx: IntentContext) -> RoutedCall | None:
+        """Inspect message and context to route deterministically without an LLM turn."""
+        if message.lower().startswith("do custom "):
+            return RoutedCall(tool_name=self.name, kwargs={"param": message[10:].strip()}, rule="MY_CUSTOM_RULE")
+        return None
+```
+
+When `FILE_ROUTER=true` (enabled by default in `.env`), the `Orchestrator` calls registered plugins' `match_intent` hooks in registry order before invoking the LLM or memory extractor. If any hook returns a `RoutedCall`, the orchestrator executes the tool directly, logs the routing event, records the turn in history, and skips the model call. See [docs/FILES.md](FILES.md) for full details on the built-in file intent router and rules R1–R7.
+
+
 
 

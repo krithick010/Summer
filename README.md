@@ -190,6 +190,7 @@ HISTORY_DB_PATH=:memory:
 | `SERVER_HOST` | `0.0.0.0` | Host interface for FastAPI server |
 | `SERVER_PORT` | `8000` | Port for FastAPI server |
 | `WEBHOOK_URL` | *(empty)* | Optional public URL for Telegram webhook mode |
+| `FILE_ROUTER` | `true` | Enable deterministic intent routing for file requests before LLM |
 | `FILE_SEARCH_MODE` | `home` | Search mode: `home`, `all_drives`, or `custom` |
 | `FILE_SEARCH_ROOTS` | *(empty)* | Comma-separated root paths for `custom` search mode |
 | `FILE_SEARCH_EXCLUDE` | *(empty)* | Comma-separated additional paths or folders to exclude |
@@ -219,9 +220,11 @@ HISTORY_DB_PATH=:memory:
 ## 📁 File Access, Search & Delivery
 
 Summer gives you fast, controlled, read-only access to files on your computer:
+- **Deterministic Intent Router (`FILE_ROUTER`)**: High-speed, zero-LLM intent routing evaluating rules R1–R7 for requests like *"find thesis.pdf"*, *"send report.pdf"*, *"tree.txt in desktop"*, or *"list downloads"*, completely bypassing model tool-calling latency and hallucinations. See [docs/FILES.md](docs/FILES.md) for full documentation.
+- **Dedicated Telegram Commands**: Run `/find <query>` for direct file searches, `/browse [path]` for folder browsing, `/index` and `/reindex` for index management, and `/cancel` to dismiss pending approvals.
 - **Interactive Button Browser (`list_folder`)**: Browse folders with inline Telegram buttons (8 items per page, directories first, files newest first). Tap `⬆ Up` to go to parent folder, `➡ More` to paginate next items inline, or tap a file to initiate sending.
 - **Background FTS5 Index (`find_files`)**: Background worker crawls files and stores metadata in `data/file_index.db` using SQLite FTS5 for sub-millisecond search across drives, combined with a quick live scan of Tier 1 user folders.
-- **Management Commands**: Send `/index` to view index status (total files, mode, roots, last crawl) or `/reindex` to trigger an immediate background re-crawl.
+- **Delivery Buttons & Preflight Checks**: Preflight checks reject missing, oversized (> 150 MB), or sensitive files before generating approval cards. For eligible files, interactive buttons allow `[Send here]` (Telegram), `[Email me]` (Gmail attachment if $\le$ 25 MB), or `[Cancel]`.
 - **Telegram Bot API Limit**: Standard Telegram bots can upload files up to **50 MB** per request. For files exceeding 50 MB (up to 150 MB), Summer automatically splits them into sequential 45 MB chunks with rejoining instructions.
 - **Local Bot API Server Note**: Standard cloud Telegram servers enforce the 50 MB file upload limit. Running a self-hosted [local Telegram Bot API server](https://core.telegram.org/bots/api#using-a-local-bot-api-server) lifts this limit up to 2,000 MB (2 GB).
 - **Email Route**: Files can also be sent as attachments via Gmail (subject to Gmail's 25 MB limit).

@@ -1471,20 +1471,41 @@ def resolve_share_target(raw_input: str) -> tuple[Path | None, list[FileMatch], 
     return None, matches, None
 
 
+ALREADY_COMPRESSED_EXTS = {
+    # Images
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".heic",
+    # Video
+    ".mp4", ".mkv", ".mov", ".avi", ".wmv", ".webm",
+    # Audio
+    ".mp3", ".aac", ".ogg", ".flac", ".m4a", ".wav",
+    # Office documents (zip-based)
+    ".docx", ".xlsx", ".pptx",
+    # PDF
+    ".pdf",
+    # Archives
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
+}
+
+
 def compress_to_zip(target: Path, dest_dir: Path) -> Path:
     """Compress a single file or directory into ``dest_dir / f'{target.name}.zip'``.
 
-    Excludes noisy, sensitive, or system files and uses ZIP_DEFLATED with
-    maximum compression (compresslevel=9).
+    Uses ZIP_STORED for already-compressed types (images, videos, pdf, docx, archives)
+    and ZIP_DEFLATED (compresslevel=6) for compressible files. Excludes noisy or sensitive subpaths.
+    Logs compression duration.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     zip_path = dest_dir / f"{target.name}.zip"
+    t_start = time.perf_counter()
 
     if target.is_file():
-        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
-            zf.write(target, arcname=target.name)
+        is_already_comp = target.suffix.lower() in ALREADY_COMPRESSED_EXTS
+        comp_type = zipfile.ZIP_STORED if is_already_comp else zipfile.ZIP_DEFLATED
+        comp_lvl = None if is_already_comp else 6
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.write(target, arcname=target.name, compress_type=comp_type, compresslevel=comp_lvl)
     elif target.is_dir():
-        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        with zipfile.ZipFile(zip_path, "w") as zf:
             for root, dirs, files in os.walk(target):
                 dirs[:] = [
                     d for d in dirs
@@ -1496,10 +1517,19 @@ def compress_to_zip(target: Path, dest_dir: Path) -> Path:
                     fp = Path(root) / f
                     if not is_sensitive_path(fp):
                         arcname = fp.relative_to(target.parent)
-                        zf.write(fp, arcname=str(arcname))
+                        is_already_comp = fp.suffix.lower() in ALREADY_COMPRESSED_EXTS
+                        comp_type = zipfile.ZIP_STORED if is_already_comp else zipfile.ZIP_DEFLATED
+                        comp_lvl = None if is_already_comp else 6
+                        zf.write(fp, arcname=str(arcname), compress_type=comp_type, compresslevel=comp_lvl)
     else:
         raise FileNotFoundError(f"Target path does not exist: {target}")
 
+    dur_ms = (time.perf_counter() - t_start) * 1000.0
+    try:
+        final_size = zip_path.stat().st_size
+    except Exception:
+        final_size = 0
+    log.info("Zipped '%s' to '%s' in %.1f ms (size: %s)", target.name, zip_path.name, dur_ms, format_size(final_size))
     return zip_path
 
 

@@ -2608,6 +2608,36 @@ class TestConfigEnvExampleSanity(unittest.TestCase):
         for expected_web_var in ("USER_LOCATION", "BROWSER_HEADLESS", "AI_NEWS_URLS"):
             self.assertIn(expected_web_var, vars_in_example)
 
+        for expected_file_var in (
+            "FILE_ROUTER",
+            "FILE_SEARCH_MODE",
+            "FILE_SEARCH_ROOTS",
+            "FILE_SEARCH_EXCLUDE",
+            "FILE_INDEX_REFRESH_HOURS",
+            "FILE_INDEX_REMOVABLE",
+            "FILE_MAX_SHARES_PER_HOUR",
+            "FILE_AUDIT_LOG",
+            "FILE_TELEGRAM_MAX_MB",
+            "FILE_MAX_SPLIT_MB",
+            "FILE_UPLOAD_TIMEOUT_S",
+        ):
+            self.assertIn(expected_file_var, vars_in_example)
+
+    def test_file_router_docs_cover_settings_and_rules(self):
+        repo_root = ROOT.parent
+        files_doc = (repo_root / "docs" / "FILES.md").read_text(encoding="utf-8")
+        readme_text = (repo_root / "README.md").read_text(encoding="utf-8")
+        plugins_doc = (repo_root / "docs" / "PLUGINS.md").read_text(encoding="utf-8")
+        example_text = (ROOT / ".env.example").read_text(encoding="utf-8")
+
+        self.assertIn("FILE_ROUTER", example_text)
+        self.assertIn("FILE_ROUTER", readme_text)
+        self.assertIn("FILE_ROUTER", files_doc)
+        self.assertIn("match_intent", plugins_doc)
+
+        for rule in ("R1", "R2", "R3", "R4", "R5", "R6", "R7"):
+            self.assertIn(rule, files_doc)
+
     def test_web_plugin_docs_cover_settings_and_debugging(self):
         repo_root = ROOT.parent
         readme_text = (repo_root / "README.md").read_text(encoding="utf-8")
@@ -5479,6 +5509,127 @@ class TestPhase4CommandsPreflightDelivery(unittest.TestCase):
         spec = p.to_tool_spec()
         self.assertNotIn("attachment_path", spec["parameters"]["properties"])
         self.assertIn("attachment_path", p.parameters_schema["properties"])
+
+
+class TestPhase5ZipSpeedAndRouterRegression(unittest.TestCase):
+    """Hermetic unit tests for Phase 5: Compression speed optimization and router regression."""
+
+    def test_zip_stored_vs_deflated_in_directory(self):
+        import zipfile
+        from plugins.file_search import compress_to_zip
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "bundle"
+            base.mkdir()
+            (base / "photo.jpg").write_bytes(b"fake jpeg data " * 50)
+            (base / "report.docx").write_bytes(b"fake docx data " * 50)
+            (base / "archive.zip").write_bytes(b"fake zip data " * 50)
+            (base / "notes.txt").write_text("compressible plain text " * 50)
+
+            out_dir = Path(td) / "output"
+            zip_path = compress_to_zip(base, out_dir)
+            self.assertTrue(zip_path.exists())
+
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                info_by_name = {Path(i.filename).name: i for i in zf.infolist()}
+                self.assertIn("photo.jpg", info_by_name)
+                self.assertIn("report.docx", info_by_name)
+                self.assertIn("archive.zip", info_by_name)
+                self.assertIn("notes.txt", info_by_name)
+
+                # Pre-compressed types must use ZIP_STORED (0)
+                self.assertEqual(info_by_name["photo.jpg"].compress_type, zipfile.ZIP_STORED)
+                self.assertEqual(info_by_name["report.docx"].compress_type, zipfile.ZIP_STORED)
+                self.assertEqual(info_by_name["archive.zip"].compress_type, zipfile.ZIP_STORED)
+
+                # Compressible plain text must use ZIP_DEFLATED (8)
+                self.assertEqual(info_by_name["notes.txt"].compress_type, zipfile.ZIP_DEFLATED)
+
+    def test_zip_single_files_stored_and_deflated(self):
+        import zipfile
+        from plugins.file_search import compress_to_zip
+
+        with tempfile.TemporaryDirectory() as td:
+            video_file = Path(td) / "clip.mp4"
+            video_file.write_bytes(b"fake video data")
+            code_file = Path(td) / "script.py"
+            code_file.write_text("print('hello world')")
+
+            out_dir = Path(td) / "single_out"
+            z_video = compress_to_zip(video_file, out_dir)
+            with zipfile.ZipFile(z_video, "r") as zf:
+                self.assertEqual(zf.infolist()[0].compress_type, zipfile.ZIP_STORED)
+
+            z_code = compress_to_zip(code_file, out_dir)
+            with zipfile.ZipFile(z_code, "r") as zf:
+                self.assertEqual(zf.infolist()[0].compress_type, zipfile.ZIP_DEFLATED)
+
+    def test_zip_logs_duration(self):
+        from plugins.file_search import compress_to_zip
+
+        with tempfile.TemporaryDirectory() as td:
+            test_file = Path(td) / "test.txt"
+            test_file.write_text("some content")
+            out_dir = Path(td) / "logs_out"
+
+            with self.assertLogs("plugins.file_search", level="INFO") as cm:
+                compress_to_zip(test_file, out_dir)
+                self.assertTrue(any("Zipped 'test.txt'" in log_line for log_line in cm.output))
+
+    def test_router_regression_suite(self):
+        """Hermetic regression test for deterministic router rules R1–R7."""
+        import time
+        from core.intent_router import match_file_intent
+        from plugins.base import IntentContext
+
+        fake_vocab = {"tree", "wallpaper", "wallpapers", "potential", "report", "final", "aicte", "whatsapp", "image", "sample"}
+
+        with patch("plugins.file_index.file_indexer.get_vocabulary", return_value=fake_vocab):
+            # R2: known file extension
+            res = match_file_intent("Tree.txt")
+            self.assertIsNotNone(res)
+            self.assertEqual(res.tool_name, "share_file")
+            self.assertEqual(res.rule, "R2")
+
+            # R2 with filler words
+            res = match_file_intent("tree.txt ig")
+            self.assertIsNotNone(res)
+            self.assertEqual(res.tool_name, "share_file")
+            self.assertEqual(res.rule, "R2")
+
+            # R3: command verb + tokens
+            res = match_file_intent("Sent me report final file")
+            self.assertIsNotNone(res)
+            self.assertEqual(res.tool_name, "share_file")
+            self.assertEqual(res.rule, "R3")
+
+            # R3: typo verb + folder
+            res = match_file_intent("Shre me the sample wallpapers folder")
+            self.assertIsNotNone(res)
+            self.assertEqual(res.tool_name, "share_file")
+            self.assertEqual(res.rule, "R3")
+
+            # R5: pronoun follow-up
+            ctx = IntentContext(last_file_path="C:/fake/report.pdf", timestamps={"last_file_path": time.time()})
+            res = match_file_intent("Mail it", ctx)
+            self.assertIsNotNone(res)
+            self.assertEqual(res.tool_name, "share_file")
+            self.assertEqual(res.kwargs.get("delivery"), "email")
+            self.assertEqual(res.rule, "R5")
+
+            # External recipient: NOT routed (must fall through to LLM)
+            res = match_file_intent("Mail it to mom")
+            self.assertIsNone(res)
+
+            # R7: folder listing
+            res = match_file_intent("list downloads")
+            self.assertIsNotNone(res)
+            self.assertEqual(res.tool_name, "list_folder")
+            self.assertEqual(res.rule, "R7")
+
+            # Non-file queries must NEVER be routed
+            for non_file in ("hi", "yo", "how is the weather?", "any ai news?", "who is Ada Lovelace on wikipedia", "weather"):
+                self.assertIsNone(match_file_intent(non_file))
 
 
 if __name__ == "__main__":

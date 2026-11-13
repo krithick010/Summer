@@ -34,6 +34,56 @@ class EvalCase:
     note: str = ""
 
 
+@dataclass(frozen=True)
+class RouterCase:
+    message: str
+    expected_tool: str | None
+    expected_rule: str | None = None
+    context_builder: Callable[[], Any] | None = None
+
+
+def _build_router_cases() -> list[RouterCase]:
+    from plugins.base import IntentContext
+
+    return [
+        RouterCase("Tree.txt", "share_file", "R2"),
+        RouterCase("tree.txt ig", "share_file", "R2"),
+        RouterCase("report_final", "share_file", "R4"),
+        RouterCase("Sent me report final file", "share_file", "R3"),
+        RouterCase("Shre me the sample wallpapers folder", "share_file", "R3"),
+        RouterCase("Ahre me the tree.txt file", "share_file", "R2"),
+        RouterCase(
+            "It's in desktop",
+            "share_file",
+            "R6",
+            lambda: IntentContext(last_query="tree.txt", timestamps={"last_query": time.time()}),
+        ),
+        RouterCase("tree.txt in documents/research notes/dsa", "share_file", "R2"),
+        RouterCase("Find me gmail_oauth.json", "find_files", "R2"),
+        RouterCase(
+            "Mail it",
+            "share_file",
+            "R5",
+            lambda: IntentContext(last_file_path="C:/fake/report.pdf", timestamps={"last_file_path": time.time()}),
+        ),
+        RouterCase("Mail it to mom", None, None),
+        RouterCase("list downloads", "list_folder", "R7"),
+        RouterCase("What is in my Downloads", "list_folder", "R7"),
+        RouterCase("hi", None, None),
+        RouterCase("yo", None, None),
+        RouterCase("how's the weather?", None, None),
+        RouterCase("any ai news?", None, None),
+        RouterCase("who is Ada Lovelace on wikipedia", None, None),
+        RouterCase("email my mom saying hi", None, None),
+        RouterCase("weather", None, None),
+        RouterCase("Aicte final", "share_file", "R4"),
+        RouterCase("tree.txt in desktop", "share_file", "R2"),
+        RouterCase("potential wallpapers folder", "share_file", None),
+        RouterCase("WhatsApp image", "share_file", "R4"),
+        RouterCase("tree.rxt", "share_file", "R2"),
+    ]
+
+
 def _build_single_turn_cases() -> list[EvalCase]:
     return [
         EvalCase("hi", None),
@@ -398,6 +448,52 @@ async def _run_eval(model_override: str | None) -> int:
         return 0
 
 
+def _run_router_eval() -> int:
+    """Run pure deterministic router evaluations without calling any LLM."""
+    from core.intent_router import match_file_intent
+    from plugins.base import IntentContext
+    from unittest.mock import patch
+
+    fake_vocab = {
+        "tree", "wallpaper", "wallpapers", "potential", "report", "final",
+        "aicte", "whatsapp", "image", "sample", "notes", "dsa", "research",
+    }
+
+    cases = _build_router_cases()
+    rows: list[tuple[str, str, str, str, bool]] = []
+    correct = 0
+
+    with patch("plugins.file_index.file_indexer.get_vocabulary", return_value=fake_vocab):
+        for case in cases:
+            ctx = case.context_builder() if case.context_builder else IntentContext()
+            t0 = time.perf_counter()
+            routed = match_file_intent(case.message, ctx)
+            elapsed = time.perf_counter() - t0
+            actual_tool = routed.tool_name if routed else None
+            actual_rule = routed.rule if routed else None
+
+            tool_match = (actual_tool == case.expected_tool)
+            rule_match = True
+            if case.expected_rule and actual_rule:
+                rule_match = (actual_rule == case.expected_rule)
+            passed = tool_match and rule_match
+            if passed:
+                correct += 1
+
+            exp_label = case.expected_tool or "none"
+            if case.expected_rule:
+                exp_label = f"{exp_label} ({case.expected_rule})"
+            act_label = actual_tool or "none"
+            if actual_rule:
+                act_label = f"{act_label} ({actual_rule})"
+
+            rows.append((case.message, exp_label, act_label, f"{elapsed*1000.0:.2f}ms", passed))
+
+    _print_table(rows, "Deterministic File Intent Router (No LLM)")
+    print(f"\n{correct}/{len(cases)} router cases correct")
+    return 0 if correct == len(cases) else 1
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate Summer's Ollama tool calling accuracy.")
     parser.add_argument("--model", help="Override OLLAMA_MODEL for this evaluation run.")
@@ -406,7 +502,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    return asyncio.run(_run_eval(args.model))
+    pc_assistant_dir = str(Path(__file__).resolve().parent.parent)
+    if pc_assistant_dir not in sys.path:
+        sys.path.insert(0, pc_assistant_dir)
+
+    print("==================================================")
+    print(" Running Router (No LLM) Regression Checks        ")
+    print("==================================================")
+    router_rc = _run_router_eval()
+
+    print("\n==================================================")
+    print(" Running LLM Tool Calling Evaluations             ")
+    print("==================================================")
+    eval_rc = asyncio.run(_run_eval(args.model))
+    return 0 if (router_rc == 0 and eval_rc == 0) else 1
 
 
 if __name__ == "__main__":
