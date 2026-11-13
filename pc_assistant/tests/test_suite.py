@@ -2781,6 +2781,115 @@ class TestFileSearch(unittest.TestCase):
                 self.assertTrue(p.exists())
                 self.assertIn(".part", p.name)
 
+    def test_search_aicte_final_avoids_single_token_match(self):
+        import config
+        from plugins.file_search import find_files
+        with tempfile.TemporaryDirectory() as td:
+            f1 = Path(td) / "aicte final.docx"
+            f1.write_text("aicte final")
+            f2 = Path(td) / "AICTE FINAL FRONT.docx"
+            f2.write_text("aicte final front")
+            f3 = Path(td) / "SPS-Instructions-Final.pdf"
+            f3.write_text("instructions")
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                res = find_files("aicte final file")
+                res_names = [p.name for p in res]
+                self.assertIn("aicte final.docx", res_names)
+                self.assertIn("AICTE FINAL FRONT.docx", res_names)
+                self.assertNotIn("SPS-Instructions-Final.pdf", res_names)
+
+    def test_search_hangover_part_2_and_vscode_pruning(self):
+        import config
+        from plugins.file_search import find_files
+        with tempfile.TemporaryDirectory() as td:
+            movie = Path(td) / "The Hangover Part II.mp4"
+            movie.write_text("movie")
+
+            mp_root = Path(td) / "multipart.py"
+            mp_root.write_text("code")
+
+            vscode = Path(td) / ".vscode"
+            vscode.mkdir()
+            mp_hidden = vscode / "multipart.py"
+            mp_hidden.write_text("code")
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                res = find_files("hangover part 2")
+                res_names = [p.name for p in res]
+                self.assertIn("The Hangover Part II.mp4", res_names)
+                self.assertNotIn("multipart.py", res_names)
+
+    def test_resume_pdf_uses_ext_filter(self):
+        import config
+        from plugins.file_search import find_files
+        with tempfile.TemporaryDirectory() as td:
+            pdf = Path(td) / "My_Resume.pdf"
+            pdf.write_text("pdf")
+            docx = Path(td) / "My_Resume.docx"
+            docx.write_text("docx")
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                res = find_files("resume pdf")
+                self.assertEqual(len(res), 1)
+                self.assertEqual(res[0].name, "My_Resume.pdf")
+
+    def test_docs_file_in_downloads_applies_root_hint_and_ext_filter(self):
+        import config
+        from plugins.file_search import find_files
+        with tempfile.TemporaryDirectory() as td:
+            dl_dir = Path(td) / "Downloads"
+            dl_dir.mkdir()
+            doc_target = dl_dir / "annual_review.docx"
+            doc_target.write_text("doc")
+            doc_wrong_ext = dl_dir / "annual_review.pdf"
+            doc_wrong_ext.write_text("pdf")
+
+            other_dir = Path(td) / "Documents"
+            other_dir.mkdir()
+            doc_other_loc = other_dir / "annual_review.docx"
+            doc_other_loc.write_text("doc in documents")
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                res = find_files("docs file in downloads")
+                self.assertEqual(len(res), 1)
+                self.assertEqual(res[0].resolve(), doc_target.resolve())
+
+    def test_direct_path_with_backslashes_resolves(self):
+        from plugins.file_search import find_files
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "sample_doc.txt"
+            f.write_text("hello")
+            backslash_path = str(f).replace("/", "\\")
+            res = find_files(backslash_path)
+            self.assertEqual(len(res), 1)
+            self.assertEqual(res[0].resolve(), f.resolve())
+
+    def test_tier_b_marks_approximate(self):
+        import config
+        from plugins.file_search import search_files
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "annual_financial_report.pdf"
+            f.write_text("report")
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                # 3 tokens: annual, financial, budget. 2 match out of 3 = 66% >= 60%
+                matches = search_files("annual financial budget")
+                self.assertEqual(len(matches), 1)
+                self.assertTrue(matches[0].approximate)
+
+    def test_unicode_names_work(self):
+        import config
+        from plugins.file_search import find_files
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "Übung_Bericht_2.docx"
+            f.write_text("bericht")
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                res = find_files("übung bericht 2")
+                self.assertEqual(len(res), 1)
+                self.assertEqual(res[0].name, "Übung_Bericht_2.docx")
+
 
 class TestFilesPlugins(unittest.TestCase):
     """Test FindFilesPlugin and ShareFilePlugin execution, previews, and routing."""
