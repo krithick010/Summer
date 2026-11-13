@@ -249,6 +249,30 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("ℹ️ No pending action to cancel.")
 
 
+async def cmd_index(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/index — Report status of the background file index."""
+    user_id = update.effective_user.id
+    if not _is_allowed(user_id):
+        await update.message.reply_text(_deny_message())
+        return
+
+    from plugins.file_index import file_indexer  # noqa: PLC0415
+    msg = file_indexer.format_status_message()
+    await update.message.reply_text(msg)
+
+
+async def cmd_reindex(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/reindex — Trigger an immediate background file crawl."""
+    user_id = update.effective_user.id
+    if not _is_allowed(user_id):
+        await update.message.reply_text(_deny_message())
+        return
+
+    from plugins.file_index import file_indexer  # noqa: PLC0415
+    file_indexer.reindex()
+    await update.message.reply_text("Reindex started.")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Route every plain text message through the LLM orchestrator."""
     user = update.effective_user
@@ -612,6 +636,8 @@ def _build_telegram_app() -> Application:
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("index", cmd_index))
+    app.add_handler(CommandHandler("reindex", cmd_reindex))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
@@ -650,6 +676,9 @@ async def lifespan(app: FastAPI):  # noqa: ANN001
     _orchestrator.set_hitl_builder(build_hitl_prompt)
     log.info("Orchestrator ready. Loaded plugins: %s", list(_orchestrator.registry.keys()))
 
+    from plugins.file_index import file_indexer  # noqa: PLC0415
+    file_indexer.start_background_worker()
+
     _telegram_app = _build_telegram_app()
     await _telegram_app.initialize()
 
@@ -672,6 +701,9 @@ async def lifespan(app: FastAPI):  # noqa: ANN001
 
     # -- Shutdown ----------------------------------------------------------
     log.info("Shutting down…")
+    from plugins.file_index import file_indexer  # noqa: PLC0415
+    file_indexer.stop()
+
     from plugins.web_scraper import close_browser
 
     await close_browser()

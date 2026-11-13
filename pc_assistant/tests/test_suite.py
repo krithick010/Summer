@@ -3835,5 +3835,175 @@ class TestPhase4HonestyAndFormatting(unittest.TestCase):
         self.assertIn("<b>Tool:</b> <code>share_file</code>", prompt_dict["text"])
 
 
+class TestFileIndex(unittest.TestCase):
+    """Hermetic unit tests for background file indexer, generational cleanup, and Telegram commands."""
+
+    def test_crawl_populates_db_and_ignores_sensitive_and_exclusions(self):
+        import sqlite3
+        from plugins.file_index import FileIndexer
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db_path = base / "index.db"
+            indexer = FileIndexer(db_path=db_path)
+
+            # Valid files
+            (base / "annual_report_2026.pdf").write_text("report")
+            (base / "user_notes.txt").write_text("notes")
+            sub = base / "projects"
+            sub.mkdir()
+            (sub / "analysis_sheet.xlsx").write_text("sheet")
+
+            # Sensitive and excluded files
+            (base / ".env").write_text("SECRET=1")
+            (base / "server.key").write_text("KEY")
+            ssh_dir = base / ".ssh"
+            ssh_dir.mkdir()
+            (ssh_dir / "id_rsa").write_text("RSA")
+            node_dir = base / "node_modules"
+            node_dir.mkdir()
+            (node_dir / "pkg.js").write_text("code")
+
+            indexed_count = indexer.crawl_sync(roots=[base])
+            self.assertGreaterEqual(indexed_count, 3)
+
+            conn = sqlite3.connect(str(db_path))
+            rows = conn.execute("SELECT name, ext, is_dir FROM files").fetchall()
+            names = [r[0] for r in rows]
+            conn.close()
+
+            # Valid items are indexed
+            self.assertIn("annual_report_2026.pdf", names)
+            self.assertIn("user_notes.txt", names)
+            self.assertIn("analysis_sheet.xlsx", names)
+
+            # Sensitive / excluded items are NOT indexed
+            self.assertNotIn(".env", names)
+            self.assertNotIn("server.key", names)
+            self.assertNotIn("id_rsa", names)
+            self.assertNotIn("pkg.js", names)
+
+    def test_deleted_file_removed_on_next_crawl_gen(self):
+        import sqlite3
+        from plugins.file_index import FileIndexer
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db_path = base / "index.db"
+            indexer = FileIndexer(db_path=db_path)
+
+            file_a = base / "keep_forever.pdf"
+            file_a.write_text("keep")
+            file_b = base / "temporary_draft.docx"
+            file_b.write_text("draft")
+
+            indexer.crawl_sync(roots=[base])
+
+            conn = sqlite3.connect(str(db_path))
+            names1 = [r[0] for r in conn.execute("SELECT name FROM files").fetchall()]
+            conn.close()
+            self.assertIn("keep_forever.pdf", names1)
+            self.assertIn("temporary_draft.docx", names1)
+
+            # Delete file_b from disk
+            file_b.unlink()
+
+            # Second crawl should purge file_b via generational cleanup
+            indexer.crawl_sync(roots=[base])
+
+            conn = sqlite3.connect(str(db_path))
+            names2 = [r[0] for r in conn.execute("SELECT name FROM files").fetchall()]
+            conn.close()
+            self.assertIn("keep_forever.pdf", names2)
+            self.assertNotIn("temporary_draft.docx", names2)
+
+    def test_query_fts5_and_like_fallback(self):
+        from plugins.file_index import FileIndexer
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db_path = base / "index.db"
+            indexer = FileIndexer(db_path=db_path)
+
+            doc = base / "annual_budget_summary.pdf"
+            doc.write_text("budget")
+
+            indexer.crawl_sync(roots=[base])
+
+            # Query via FTS5
+            res_fts = indexer.search(["budget", "annual"], ext_filters=[".pdf"], force_like=False)
+            self.assertEqual(len(res_fts), 1)
+            self.assertEqual(res_fts[0].path.name, "annual_budget_summary.pdf")
+
+            # Query via LIKE fallback
+            res_like = indexer.search(["budget", "annual"], ext_filters=[".pdf"], force_like=True)
+            self.assertEqual(len(res_like), 1)
+            self.assertEqual(res_like[0].path.name, "annual_budget_summary.pdf")
+
+    def test_fast_livescan_finds_file_created_after_index(self):
+        import config
+        from plugins.file_index import FileIndexer
+        from plugins.file_search import FileMatch, search_files
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            db_path = base / "index.db"
+            indexer = FileIndexer(db_path=db_path)
+            downloads = base / "Downloads"
+            downloads.mkdir()
+
+            initial_file = downloads / "existing_doc.pdf"
+            initial_file.write_text("existing")
+
+            # Run initial crawl
+            indexer.crawl_sync(roots=[base])
+
+            # Create brand new file AFTER crawl has completed
+            fresh_file = downloads / "urgent_invoice_new.pdf"
+            fresh_file.write_text("invoice")
+
+            with patch("plugins.file_index.file_indexer", indexer):
+                with patch("plugins.file_search._scan_tier1_fast", return_value=[
+                    FileMatch(path=fresh_file, size=10, mtime=time.time(), approximate=False)
+                ]):
+                    matches = search_files("urgent invoice new")
+                    self.assertGreaterEqual(len(matches), 1)
+                    self.assertEqual(matches[0].path.resolve(), fresh_file.resolve())
+
+    def test_index_command_and_reindex_command(self):
+        import config
+        import main
+        from plugins.file_index import FileIndexer
+
+        with tempfile.TemporaryDirectory() as td:
+            indexer = FileIndexer(db_path=Path(td) / "test.db")
+            (Path(td) / "sample.pdf").write_text("sample")
+            indexer.crawl_sync(roots=[Path(td)])
+
+            status_msg = indexer.format_status_message()
+            self.assertIn("Indexed", status_msg)
+            self.assertIn("files.", status_msg)
+            self.assertIn("Last crawl:", status_msg)
+            self.assertIn("Mode:", status_msg)
+
+            # Test command handlers
+            mock_update = MagicMock()
+            mock_update.effective_user.id = 123456789
+            mock_update.message.reply_text = AsyncMock()
+            mock_context = MagicMock()
+
+            with patch.object(config, "ALLOWED_USER_IDS", [123456789]):
+                with patch("plugins.file_index.file_indexer", indexer):
+                    _run(main.cmd_index(mock_update, mock_context))
+                    mock_update.message.reply_text.assert_called()
+                    last_call_text = mock_update.message.reply_text.call_args[0][0]
+                    self.assertIn("Indexed", last_call_text)
+
+                    with patch.object(indexer, "reindex") as mock_reindex:
+                        _run(main.cmd_reindex(mock_update, mock_context))
+                        mock_reindex.assert_called_once()
+                        mock_update.message.reply_text.assert_called_with("Reindex started.")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

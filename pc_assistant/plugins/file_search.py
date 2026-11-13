@@ -721,6 +721,59 @@ def get_search_roots() -> list[Path]:
     return roots_for_mode(mode)
 
 
+def _scan_tier1_fast(
+    name_tokens: list[str],
+    ext_filters: list[str],
+    timeout_sec: float = 1.5,
+) -> list[FileMatch]:
+    """Perform a fast live walk of standard user folders capped at timeout_sec."""
+    home = Path.home()
+    priority_subdirs = ["Desktop", "Downloads", "Documents", "Pictures", "Videos", "Music"]
+    roots: list[Path] = []
+    for d in priority_subdirs:
+        p = home / d
+        if p.is_dir() and not is_sensitive_path(p) and not is_excluded_path(p):
+            roots.append(p.resolve())
+
+    # OneDrive folders
+    try:
+        for p in home.iterdir():
+            if p.is_dir() and p.name.lower().startswith("onedrive") and not is_sensitive_path(p):
+                for d in priority_subdirs:
+                    od_sub = p / d
+                    if od_sub.is_dir() and not is_sensitive_path(od_sub) and not is_excluded_path(od_sub):
+                        roots.append(od_sub.resolve())
+    except Exception:
+        pass
+
+    matches: list[FileMatch] = []
+    t0 = time.perf_counter()
+
+    for root_dir in roots:
+        if (time.perf_counter() - t0) > timeout_sec:
+            break
+        for current_root, dirs, files in os.walk(str(root_dir), onerror=lambda _: None):
+            if (time.perf_counter() - t0) > timeout_sec:
+                break
+            curr_p = Path(current_root)
+            dirs[:] = [d for d in dirs if not _should_skip_dir(d, curr_p / d)]
+            for f in files:
+                if f.startswith("."):
+                    continue
+                fp = curr_p / f
+                if is_sensitive_path(fp) or is_excluded_path(fp):
+                    continue
+                res = _match_candidate(fp, name_tokens, ext_filters)
+                if res is not None:
+                    _, approx = res
+                    try:
+                        st = fp.stat()
+                        matches.append(FileMatch(path=fp, size=st.st_size, mtime=st.st_mtime, approximate=approx))
+                    except Exception:
+                        pass
+    return matches
+
+
 def search_files(query: str, file_type: str = "", max_results: int = 5) -> list[FileMatch]:
     """Find files or folders matching ``query`` returning list of FileMatch objects."""
     cleaned_query = query.strip().strip('"\'')
@@ -764,6 +817,35 @@ def search_files(query: str, file_type: str = "", max_results: int = 5) -> list[
                     override_roots.append(p.resolve())
     elif mode == "all_drives":
         override_roots = roots_for_mode("all_drives")
+
+    # 2. If index is ready and no explicit root override, merge index search with fast Tier 1 live-scan
+    from plugins.file_index import file_indexer  # noqa: PLC0415
+    if file_indexer.is_ready() and root_hint is None and not override_roots:
+        index_matches = file_indexer.search(
+            name_tokens=name_tokens,
+            ext_filters=ext_filters,
+            max_results=max_results * 4,
+        )
+        live_matches = _scan_tier1_fast(name_tokens, ext_filters, timeout_sec=1.5)
+
+        seen_paths: set[Path] = set()
+        merged_scored: list[tuple[int, float, FileMatch]] = []
+
+        for m in live_matches + index_matches:
+            try:
+                res_p = m.path.resolve()
+            except Exception:
+                res_p = m.path
+            if res_p in seen_paths:
+                continue
+            seen_paths.add(res_p)
+            match_res = _match_candidate(m.path, name_tokens, ext_filters)
+            if match_res is not None:
+                score, approx = match_res
+                merged_scored.append((score, m.mtime, FileMatch(path=m.path, size=m.size, mtime=m.mtime, approximate=approx)))
+
+        merged_scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [match for _, _, match in merged_scored[:max_results]]
 
     home = Path.home()
     priority_subdirs = ["Desktop", "Downloads", "Documents", "Pictures", "Videos", "Music"]

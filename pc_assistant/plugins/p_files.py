@@ -73,10 +73,15 @@ class FindFilesPlugin(PluginBase):
             )
 
         matches = await asyncio.to_thread(search_files, query)
+        from plugins.file_index import file_indexer  # noqa: PLC0415
+        is_building = not file_indexer.is_ready()
+
         if not matches:
             roots = get_search_roots()
             folders = ", ".join(p.name or str(p) for p in roots)
             no_match_msg = f"No match for '{query}'. Looked in: {folders}."
+            if is_building:
+                no_match_msg = f"Index is building, showing quick search results...\n{no_match_msg}"
             return PluginResult(
                 success=False,
                 output=no_match_msg,
@@ -100,6 +105,8 @@ class FindFilesPlugin(PluginBase):
 
         list_text = "\n".join(lines)
         direct_reply = f"{list_text}\nTap one to send it."
+        if is_building:
+            direct_reply = f"Index is building, showing quick search results...\n{direct_reply}"
         return PluginResult(
             success=True,
             output=direct_reply,
