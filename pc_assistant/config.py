@@ -131,8 +131,20 @@ HITL_TIMEOUT_SECONDS: int = int(os.getenv("HITL_TIMEOUT_SECONDS", "120"))
 # ---------------------------------------------------------------------------
 # File Sharing & Search
 # ---------------------------------------------------------------------------
+# Search mode: "home" (default), "all_drives", or "custom"
+FILE_SEARCH_MODE: str = os.getenv("FILE_SEARCH_MODE", "home").strip().lower()
 # Optional comma-separated root paths to search (empty = priority user folders then home)
 FILE_SEARCH_ROOTS: str = os.getenv("FILE_SEARCH_ROOTS", "")
+# Comma-separated additional paths or folder names to prune in addition to defaults
+FILE_SEARCH_EXCLUDE: str = os.getenv("FILE_SEARCH_EXCLUDE", "")
+# Float/int hours between background file index re-crawls
+FILE_INDEX_REFRESH_HOURS: float = float(os.getenv("FILE_INDEX_REFRESH_HOURS", "6"))
+# Whether USB / external removable drives are indexed
+FILE_INDEX_REMOVABLE: bool = os.getenv("FILE_INDEX_REMOVABLE", "false").strip().lower() in ("true", "1", "yes")
+# Rate limiter for approved file shares per rolling hour
+FILE_MAX_SHARES_PER_HOUR: int = int(os.getenv("FILE_MAX_SHARES_PER_HOUR", "20"))
+# Append-only audit log for file operations
+FILE_AUDIT_LOG: bool = os.getenv("FILE_AUDIT_LOG", "true").strip().lower() in ("true", "1", "yes")
 # Maximum file size (MB) sent directly over Telegram without compression or email routing
 FILE_TELEGRAM_MAX_MB: float = float(os.getenv("FILE_TELEGRAM_MAX_MB", "50.0"))
 # Maximum post-zip file size (MB) eligible for multi-part 45 MB chunks over Telegram

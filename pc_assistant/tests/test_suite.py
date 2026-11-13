@@ -2890,6 +2890,113 @@ class TestFileSearch(unittest.TestCase):
                 self.assertEqual(len(res), 1)
                 self.assertEqual(res[0].name, "Übung_Bericht_2.docx")
 
+    def test_roots_per_mode(self):
+        import config
+        from collections import namedtuple
+        from plugins.file_search import roots_for_mode
+
+        # home mode
+        home_roots = roots_for_mode("home")
+        self.assertEqual(home_roots, [Path.home()])
+
+        # custom mode
+        with tempfile.TemporaryDirectory() as td1, tempfile.TemporaryDirectory() as td2:
+            custom_roots_str = f"{td1},{td2},/nonexistent/fake/dir/xyz"
+            with patch.object(config, "FILE_SEARCH_ROOTS", custom_roots_str):
+                custom_roots = roots_for_mode("custom")
+                self.assertEqual(len(custom_roots), 2)
+                self.assertIn(Path(td1).resolve(), custom_roots)
+                self.assertIn(Path(td2).resolve(), custom_roots)
+
+        # all_drives mode
+        Partition = namedtuple("Partition", ["device", "mountpoint", "fstype", "opts"])
+        with tempfile.TemporaryDirectory() as fake_d:
+            fake_partitions = [
+                Partition("D:\\", fake_d, "NTFS", "rw,fixed"),
+                Partition("E:\\", "E:\\", "iso9660", "ro,cdrom"),
+                Partition("Z:\\", "Z:\\", "cifs", "rw,network"),
+                Partition("F:\\", fake_d, "FAT32", "rw,removable"),
+            ]
+            with patch("psutil.disk_partitions", return_value=fake_partitions):
+                with patch.object(config, "FILE_INDEX_REMOVABLE", False):
+                    roots = roots_for_mode("all_drives")
+                    self.assertIn(Path.home(), roots)
+                    self.assertIn(Path(fake_d), roots)
+                    self.assertNotIn(Path("E:\\"), roots)
+                    self.assertNotIn(Path("Z:\\"), roots)
+
+                with patch.object(config, "FILE_INDEX_REMOVABLE", True):
+                    roots_rem = roots_for_mode("all_drives")
+                    self.assertIn(Path.home(), roots_rem)
+
+    def test_exclusions_applied(self):
+        import config
+        from plugins.file_search import is_excluded_path
+
+        # Windows system paths & always excluded names
+        self.assertTrue(is_excluded_path("C:\\Windows\\System32\\cmd.exe"))
+        self.assertTrue(is_excluded_path("C:\\Program Files\\App\\run.exe"))
+        self.assertTrue(is_excluded_path("C:\\ProgramData\\file.dat"))
+        self.assertTrue(is_excluded_path("D:\\$Recycle.Bin\\deleted.txt"))
+        self.assertTrue(is_excluded_path("D:\\System Volume Information\\wps.db"))
+        self.assertTrue(is_excluded_path("C:\\Users\\krith\\AppData\\Local\\temp.txt"))
+        self.assertTrue(is_excluded_path("project/node_modules/pkg/index.js"))
+        self.assertTrue(is_excluded_path("project/.venv/bin/activate"))
+        self.assertTrue(is_excluded_path("project/__pycache__/mod.pyc"))
+
+        # Dot-directories
+        self.assertTrue(is_excluded_path("home/.config/settings.json"))
+        self.assertTrue(is_excluded_path(".hidden_folder/file.txt"))
+
+        # POSIX mounts
+        self.assertTrue(is_excluded_path("/proc/cpuinfo"))
+        self.assertTrue(is_excluded_path("/sys/devices"))
+        self.assertTrue(is_excluded_path("/dev/null"))
+        self.assertTrue(is_excluded_path("/etc/passwd"))
+
+        # Custom exclude
+        with patch.object(config, "FILE_SEARCH_EXCLUDE", "secret_project,junk_folder"):
+            self.assertTrue(is_excluded_path("C:\\Users\\krith\\secret_project\\doc.txt"))
+            self.assertTrue(is_excluded_path("/home/user/junk_folder/test.dat"))
+            self.assertFalse(is_excluded_path("C:\\Users\\krith\\other_project\\doc.txt"))
+
+    def test_symlink_or_junction_loop_avoidance(self):
+        import config
+        from plugins.file_search import is_reparse_point, search_files
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            sub = base / "subfolder"
+            sub.mkdir()
+            target_file = sub / "my_secret_report.pdf"
+            target_file.write_text("dummy")
+
+            loop_dir = sub / "loop_dir"
+            can_symlink = False
+            try:
+                loop_dir.symlink_to(sub, target_is_directory=True)
+                can_symlink = True
+            except (OSError, NotImplementedError):
+                pass
+
+            if can_symlink:
+                self.assertTrue(is_reparse_point(loop_dir))
+                with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                    with patch.object(config, "FILE_SEARCH_MODE", "custom"):
+                        matches = search_files("secret report")
+                        self.assertEqual(len(matches), 1)
+                        self.assertEqual(matches[0].path.resolve(), target_file.resolve())
+            else:
+                with patch("plugins.file_search.is_reparse_point", side_effect=lambda p: Path(p).name == "fake_loop"):
+                    fake_loop = sub / "fake_loop"
+                    fake_loop.mkdir()
+                    (fake_loop / "inner.pdf").write_text("inner")
+                    with patch.object(config, "FILE_SEARCH_ROOTS", td):
+                        with patch.object(config, "FILE_SEARCH_MODE", "custom"):
+                            matches = search_files("secret report")
+                            self.assertEqual(len(matches), 1)
+                            self.assertEqual(matches[0].path.resolve(), target_file.resolve())
+
 
 class TestFilesPlugins(unittest.TestCase):
     """Test FindFilesPlugin and ShareFilePlugin execution, previews, and routing."""

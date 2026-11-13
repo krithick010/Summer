@@ -16,6 +16,8 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
+import tempfile
 import time
 from typing import Sequence
 import zipfile
@@ -42,22 +44,43 @@ SENSITIVE_NAMES = {
 SENSITIVE_EXTS = {".key", ".pem"}
 
 # Directory names pruned in-place
-SKIP_DIRS = {
+ALWAYS_EXCLUDED_NAMES: set[str] = {
+    "windows",
+    "program files",
+    "program files (x86)",
+    "programdata",
+    "$recycle.bin",
+    "system volume information",
+    "recovery",
+    "perflogs",
+    "appdata",
+    "application data",
     "node_modules",
     "venv",
     ".venv",
     "__pycache__",
     "site-packages",
-    "appdata",
-    "application data",
-    "$recycle.bin",
-    "windows",
-    "program files",
-    "program files (x86)",
-    "programdata",
     "ms-playwright",
     "tmp_shares",
 }
+SKIP_DIRS = ALWAYS_EXCLUDED_NAMES
+
+POSIX_EXCLUDED_PREFIXES: tuple[str, ...] = (
+    "/proc",
+    "/sys",
+    "/dev",
+    "/run",
+    "/snap",
+    "/var/lib",
+    "/System",
+    "/Library",
+    "/private/var",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/etc",
+    "/opt/homebrew",
+)
 
 # Type words mapped to corresponding extension filters
 TYPE_EXTENSIONS: dict[str, list[str]] = {
@@ -155,11 +178,183 @@ def is_sensitive_path(path: Path | str) -> bool:
     return False
 
 
-def _should_skip_dir(name: str) -> bool:
-    """Return True if directory should be pruned from walk."""
-    if name.startswith("."):
+def is_reparse_point(path: Path | str) -> bool:
+    """Return True if path is a symlink or Windows junction / reparse point."""
+    try:
+        p = Path(path)
+        if p.is_symlink():
+            return True
+        st = os.lstat(str(p))
+        attrs = getattr(st, "st_file_attributes", 0)
+        reparse_attr = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+        if bool(attrs & reparse_attr):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def is_excluded_path(path: Path | str) -> bool:
+    """Return True if path matches system exclusions, dot-directories, or FILE_SEARCH_EXCLUDE."""
+    try:
+        p = Path(path)
+    except Exception:
         return True
-    return name.lower() in SKIP_DIRS
+
+    for part in p.parts:
+        if part.startswith(".") and part not in (".", ".."):
+            return True
+
+    is_under_temp = False
+    try:
+        tmp_dir = Path(tempfile.gettempdir()).resolve()
+        p_res = p.resolve()
+        if p_res == tmp_dir or tmp_dir in p_res.parents:
+            is_under_temp = True
+    except Exception:
+        pass
+
+    parts_lower = [part.lower() for part in p.parts]
+    p_str = str(p).replace("\\", "/")
+    p_lower = p_str.lower()
+
+    for part in parts_lower:
+        if is_under_temp and part in ("appdata", "application data", "local", "roaming", "locallow"):
+            continue
+        if part in ALWAYS_EXCLUDED_NAMES:
+            return True
+        if not is_under_temp and "appdata" in part:
+            return True
+
+    windir = os.environ.get("WINDIR") or os.environ.get("SystemRoot")
+    if windir:
+        try:
+            windir_p = Path(windir).resolve()
+            p_res = p.resolve()
+            if p_res == windir_p or windir_p in p_res.parents:
+                return True
+        except Exception:
+            pass
+
+    for prefix in POSIX_EXCLUDED_PREFIXES:
+        pref_clean = prefix.rstrip("/")
+        if p_str == pref_clean or p_str.startswith(f"{pref_clean}/") or p_lower == pref_clean.lower() or p_lower.startswith(f"{pref_clean.lower()}/"):
+            return True
+
+    try:
+        data_dir_cfg = getattr(config, "DATA_DIR", "data")
+        if data_dir_cfg:
+            data_dir = Path(data_dir_cfg).resolve()
+            p_res = p.resolve()
+            if p_res == data_dir or data_dir in p_res.parents:
+                return True
+    except Exception:
+        pass
+
+    custom_exclude = getattr(config, "FILE_SEARCH_EXCLUDE", "")
+    if custom_exclude:
+        for ex in custom_exclude.split(","):
+            ex_str = ex.strip()
+            if not ex_str:
+                continue
+            if "/" in ex_str or "\\" in ex_str:
+                try:
+                    ex_p = Path(os.path.expandvars(os.path.expanduser(ex_str))).resolve()
+                    p_res = p.resolve()
+                    if p_res == ex_p or ex_p in p_res.parents:
+                        return True
+                except Exception:
+                    pass
+            else:
+                if ex_str.lower() in parts_lower or ex_str.lower() == p.name.lower():
+                    return True
+
+    return False
+
+
+def roots_for_mode(mode: str | None = None) -> list[Path]:
+    """Return root search paths based on mode ('home', 'all_drives', or 'custom')."""
+    active_mode = (mode or getattr(config, "FILE_SEARCH_MODE", "home")).strip().lower()
+
+    if active_mode == "custom":
+        custom_str = getattr(config, "FILE_SEARCH_ROOTS", "")
+        roots: list[Path] = []
+        for r in custom_str.split(","):
+            r_str = r.strip()
+            if r_str:
+                p = Path(os.path.expandvars(os.path.expanduser(r_str)))
+                if p.exists() and p.is_dir() and not is_reparse_point(p):
+                    try:
+                        resolved = p.resolve()
+                        if not is_sensitive_path(resolved) and not is_excluded_path(resolved) and resolved not in roots:
+                            roots.append(resolved)
+                    except Exception:
+                        pass
+        return roots or [Path.home()]
+
+    if active_mode == "all_drives":
+        roots: list[Path] = [Path.home()]
+        allow_removable = getattr(config, "FILE_INDEX_REMOVABLE", False)
+        try:
+            import psutil
+            for part in psutil.disk_partitions(all=False):
+                opts = [o.strip() for o in part.opts.lower().split(",")]
+                fstype = part.fstype.lower()
+                if "cdrom" in opts or fstype in ("iso9660", "udf"):
+                    continue
+                if "network" in opts or fstype in ("nfs", "smbfs", "cifs", "afs"):
+                    continue
+                if "removable" in opts and not allow_removable:
+                    continue
+                mount = Path(part.mountpoint)
+                if mount.exists() and mount.is_dir():
+                    try:
+                        resolved = mount.resolve()
+                        if (
+                            resolved not in roots
+                            and mount not in roots
+                            and not is_sensitive_path(resolved)
+                            and not is_excluded_path(resolved)
+                        ):
+                            roots.append(mount)
+                    except Exception:
+                        pass
+        except Exception as exc:
+            log.warning("Failed enumerating disk partitions for all_drives: %s", exc)
+        return roots
+
+    # default: "home"
+    return [Path.home()]
+
+
+def _should_skip_dir(name: str, full_path: Path | None = None) -> bool:
+    """Return True if directory should be pruned from walk."""
+    if name.startswith(".") and name not in (".", ".."):
+        return True
+    name_l = name.lower()
+    is_under_temp = False
+    if full_path is not None:
+        try:
+            tmp_dir = Path(tempfile.gettempdir()).resolve()
+            p_res = full_path.resolve()
+            if p_res == tmp_dir or tmp_dir in p_res.parents:
+                is_under_temp = True
+        except Exception:
+            pass
+
+    if name_l in ALWAYS_EXCLUDED_NAMES or name_l in SKIP_DIRS:
+        if not (is_under_temp and name_l in ("appdata", "application data", "local", "roaming", "locallow")):
+            return True
+    if "appdata" in name_l and not is_under_temp:
+        return True
+    if full_path is not None:
+        if is_reparse_point(full_path):
+            return True
+        if is_excluded_path(full_path):
+            return True
+        if is_sensitive_path(full_path):
+            return True
+    return False
 
 
 def split_stem_tokens(stem: str) -> list[str]:
@@ -341,26 +536,30 @@ def _match_candidate(
 
 
 def get_search_roots() -> list[Path]:
-    """Return configured or priority search roots."""
-    if config.FILE_SEARCH_ROOTS:
-        override_roots: list[Path] = []
-        for r in config.FILE_SEARCH_ROOTS.split(","):
-            r_str = r.strip()
-            if r_str:
-                p = Path(os.path.expandvars(os.path.expanduser(r_str)))
-                if p.exists() and p.is_dir() and not is_sensitive_path(p):
-                    override_roots.append(p.resolve())
-        if override_roots:
-            return override_roots
+    """Return configured or priority search roots based on mode."""
+    mode = getattr(config, "FILE_SEARCH_MODE", "home").strip().lower()
+    if mode == "home":
+        if config.FILE_SEARCH_ROOTS:
+            override_roots: list[Path] = []
+            for r in config.FILE_SEARCH_ROOTS.split(","):
+                r_str = r.strip()
+                if r_str:
+                    p = Path(os.path.expandvars(os.path.expanduser(r_str)))
+                    if p.exists() and p.is_dir() and not is_sensitive_path(p) and not is_excluded_path(p):
+                        override_roots.append(p.resolve())
+            if override_roots:
+                return override_roots
 
-    home = Path.home()
-    priority_subdirs = ["Desktop", "Downloads", "Documents", "Pictures", "Videos", "Music"]
-    roots: list[Path] = []
-    for d in priority_subdirs:
-        p = home / d
-        if p.exists() and p.is_dir() and not is_sensitive_path(p):
-            roots.append(p)
-    return roots or [home]
+        home = Path.home()
+        priority_subdirs = ["Desktop", "Downloads", "Documents", "Pictures", "Videos", "Music"]
+        roots: list[Path] = []
+        for d in priority_subdirs:
+            p = home / d
+            if p.exists() and p.is_dir() and not is_sensitive_path(p) and not is_excluded_path(p):
+                roots.append(p)
+        return roots or [home]
+
+    return roots_for_mode(mode)
 
 
 def search_files(query: str, file_type: str = "", max_results: int = 5) -> list[FileMatch]:
@@ -376,7 +575,7 @@ def search_files(query: str, file_type: str = "", max_results: int = 5) -> list[
         candidate = Path(expanded)
         if candidate.exists():
             resolved = candidate.resolve()
-            if not is_sensitive_path(resolved):
+            if not is_sensitive_path(resolved) and not is_excluded_path(resolved):
                 st = resolved.stat()
                 return [FileMatch(path=resolved, size=st.st_size, mtime=st.st_mtime, approximate=False)]
             return []
@@ -395,14 +594,17 @@ def search_files(query: str, file_type: str = "", max_results: int = 5) -> list[
         return []
 
     # Determine search roots
+    mode = getattr(config, "FILE_SEARCH_MODE", "home").strip().lower()
     override_roots: list[Path] = []
-    if config.FILE_SEARCH_ROOTS:
-        for r in config.FILE_SEARCH_ROOTS.split(","):
+    if mode == "custom" or (mode == "home" and config.FILE_SEARCH_ROOTS):
+        for r in (config.FILE_SEARCH_ROOTS or "").split(","):
             r_str = r.strip()
             if r_str:
                 p = Path(os.path.expandvars(os.path.expanduser(r_str)))
-                if p.exists() and p.is_dir() and not is_sensitive_path(p):
+                if p.exists() and p.is_dir() and not is_sensitive_path(p) and not is_excluded_path(p):
                     override_roots.append(p.resolve())
+    elif mode == "all_drives":
+        override_roots = roots_for_mode("all_drives")
 
     home = Path.home()
     priority_subdirs = ["Desktop", "Downloads", "Documents", "Pictures", "Videos", "Music"]
@@ -411,21 +613,34 @@ def search_files(query: str, file_type: str = "", max_results: int = 5) -> list[
 
     def _scan_root(root_dir: Path, timeout_sec: float | None = None, start_time: float | None = None) -> bool:
         """Walk root_dir and collect matches. Returns True if timed out."""
+        visited_dirs: set[Path] = set()
         for current_root, dirs, files in os.walk(str(root_dir), onerror=lambda _: None):
             if timeout_sec and start_time and (time.perf_counter() - start_time) > timeout_sec:
                 return True
 
+            curr_p = Path(current_root)
+            try:
+                curr_res = curr_p.resolve()
+                if curr_res in visited_dirs:
+                    dirs[:] = []
+                    continue
+                visited_dirs.add(curr_res)
+            except Exception:
+                pass
+
             # Prune noisy, hidden, or sensitive directories in-place
             dirs[:] = [
                 d for d in dirs
-                if not _should_skip_dir(d) and not is_sensitive_path(Path(current_root) / d)
+                if not _should_skip_dir(d, curr_p / d)
             ]
 
             # Check files
             for f in files:
                 if f.startswith("."):
                     continue
-                file_path = Path(current_root) / f
+                file_path = curr_p / f
+                if is_excluded_path(file_path) or is_sensitive_path(file_path):
+                    continue
                 res = _match_candidate(file_path, name_tokens, ext_filters)
                 if res is not None:
                     score, approx = res
@@ -486,7 +701,7 @@ def search_files(query: str, file_type: str = "", max_results: int = 5) -> list[
                                     scored_matches.append((score, st.st_mtime, FileMatch(path=entry, size=st.st_size, mtime=st.st_mtime, approximate=approx)))
                             continue
 
-                        if _should_skip_dir(entry.name) or is_sensitive_path(entry):
+                        if _should_skip_dir(entry.name, entry) or is_sensitive_path(entry) or is_excluded_path(entry):
                             continue
 
                         if str(entry.resolve()).lower() in searched_tier1_paths:
@@ -536,7 +751,7 @@ def compress_to_zip(target: Path, dest_dir: Path) -> Path:
             for root, dirs, files in os.walk(target):
                 dirs[:] = [
                     d for d in dirs
-                    if not _should_skip_dir(d) and not is_sensitive_path(Path(root) / d)
+                    if not _should_skip_dir(d, Path(root) / d) and not is_sensitive_path(Path(root) / d)
                 ]
                 for f in files:
                     if f.startswith("."):
