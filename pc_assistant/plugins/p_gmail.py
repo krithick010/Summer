@@ -120,6 +120,18 @@ class GmailPlugin(PluginBase):
         )
         return False
 
+    def to_tool_spec(self) -> dict[str, Any]:
+        """Return model-facing tool specification without attachment_path."""
+        props = dict(self.parameters_schema.get("properties", {}))
+        props.pop("attachment_path", None)
+        schema = dict(self.parameters_schema)
+        schema["properties"] = props
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": schema,
+        }
+
     # ------------------------------------------------------------------
     # OAuth credential helper (blocking — called via asyncio.to_thread)
     # ------------------------------------------------------------------

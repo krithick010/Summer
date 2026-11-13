@@ -3794,8 +3794,13 @@ class TestPhase4HonestyAndFormatting(unittest.TestCase):
             "find_files: use for when they ask to search, find, or locate files by keyword",
             prompt,
         )
+        # share_file is hidden from model-facing prompt (Phase 4 requirement)
+        self.assertNotIn(
+            "share_file: use for",
+            prompt,
+        )
         self.assertIn(
-            "share_file: use for when they ask to send, share, upload, or email a specific file or folder (pass the path or filename)",
+            "File requests are handled by dedicated commands and buttons; if asked to find a file, call find_files.",
             prompt,
         )
 
@@ -4873,8 +4878,8 @@ class TestPhase4TelegramAwarenessAndNoDoubleReply(unittest.TestCase):
     def test_system_prompt_contains_telegram_awareness(self):
         from core.orchestrator import build_system_prompt
         prompt = build_system_prompt()
-        self.assertIn("directly inside Telegram right now", prompt)
-        self.assertIn("The file will be sent right here in this Telegram chat", prompt)
+        self.assertIn("File requests are handled by dedicated commands and buttons; if asked to find a file, call find_files.", prompt)
+        self.assertNotIn("directly inside Telegram right now", prompt)
 
     def test_hitl_approval_with_direct_reply_skips_resume_tool_loop(self):
         import main
@@ -5304,6 +5309,176 @@ class TestPhase3FileIntentRouter(unittest.TestCase):
             self.assertEqual(hist[0]["role"], "user")
             self.assertEqual(hist[0]["content"], "list downloads")
             self.assertEqual(hist[-1]["role"], "assistant")
+
+
+class TestPhase4CommandsPreflightDelivery(unittest.TestCase):
+    """Hermetic unit tests for Phase 4: commands, preflight checks, delivery buttons, and slimmer model."""
+
+    def setUp(self):
+        from core.choices import ChoiceStore
+        from core.state_manager import StateManager
+        self.sm = StateManager()
+        self.cs = ChoiceStore()
+
+    def test_commands_find_and_browse_work_without_llm(self):
+        import config
+        import main
+        from core.llm_engine import LLMEngine
+        from core.orchestrator import Orchestrator
+
+        mock_llm = MagicMock(spec=LLMEngine)
+        orch = Orchestrator(llm=mock_llm, state_manager=self.sm, choice_store=self.cs)
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            (base / "test_contract.txt").write_text("hello")
+
+            with patch.object(main, "_orchestrator", orch), \
+                 patch.object(main, "_is_allowed", return_value=True), \
+                 patch.object(config, "FILE_SEARCH_ROOTS", str(base)), \
+                 patch.object(config, "FILE_SEARCH_MODE", "custom"):
+
+                # Test /find
+                update_find = MagicMock()
+                update_find.effective_user.id = 1234
+                update_find.effective_chat.id = 1234
+                update_find.message.reply_text = AsyncMock()
+
+                context_find = MagicMock()
+                context_find.args = ["test_contract"]
+
+                _run(main.cmd_find(update_find, context_find))
+                mock_llm.chat.assert_not_called()
+                self.assertTrue(update_find.message.reply_text.called)
+
+                # Test /browse
+                update_browse = MagicMock()
+                update_browse.effective_user.id = 1234
+                update_browse.effective_chat.id = 1234
+                update_browse.message.reply_text = AsyncMock()
+
+                context_browse = MagicMock()
+                context_browse.args = [str(base)]
+
+                _run(main.cmd_browse(update_browse, context_browse))
+                mock_llm.chat.assert_not_called()
+                self.assertTrue(update_browse.message.reply_text.called)
+
+    def test_preflight_blocks_card_when_too_big_sensitive_or_missing(self):
+        import config
+        from core.orchestrator import Orchestrator
+
+        orch = Orchestrator(state_manager=self.sm, choice_store=self.cs)
+        orch.set_hitl_builder(lambda **kw: {"text": "card", "reply_markup": MagicMock()})
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+
+            with patch.object(config, "FILE_SEARCH_ROOTS", str(base)), \
+                 patch.object(config, "FILE_SEARCH_MODE", "custom"):
+
+                # 1. Missing file -> no card
+                res_missing = _run(orch.request_tool_approval(1, "share_file", {"path": str(base / "ghost.txt")}))
+                self.assertNotIn("reply_markup", res_missing)
+                self.assertTrue("not found" in res_missing["text"].lower() or "no file found" in res_missing["text"].lower())
+
+                # 2. Sensitive file -> no card
+                sens = base / ".env"
+                sens.write_text("SECRET=1")
+                res_sens = _run(orch.request_tool_approval(1, "share_file", {"path": str(sens)}))
+                self.assertNotIn("reply_markup", res_sens)
+                self.assertIn("sensitive", res_sens["text"].lower())
+
+                # 3. Oversized file (> FILE_MAX_SPLIT_MB) -> no card
+                import stat as stat_mod
+                huge = base / "huge.bin"
+                huge.write_text("data")
+                with patch("pathlib.Path.stat") as mock_stat:
+                    stat_obj = MagicMock()
+                    stat_obj.st_size = 200 * 1024 * 1024
+                    stat_obj.st_mode = stat_mod.S_IFREG | 0o644
+                    stat_obj.st_mtime = 1000.0
+                    mock_stat.return_value = stat_obj
+
+                    res_huge = _run(orch.request_tool_approval(1, "share_file", {"path": str(huge)}))
+                    self.assertNotIn("reply_markup", res_huge)
+                    self.assertIn("Telegram bots can upload 50 MB (150 MB in parts); Gmail allows 25 MB", res_huge["text"])
+
+    def test_card_has_three_buttons_only_when_email_possible(self):
+        from main import build_hitl_prompt
+
+        # Case 1: email possible (Gmail available, <= 25 MB) -> 3 buttons
+        card3 = build_hitl_prompt("aid1", "preview", "share_file", can_email=True)
+        buttons3 = card3["reply_markup"].inline_keyboard[0]
+        labels3 = [b.text for b in buttons3]
+        self.assertEqual(labels3, ["Send here", "Email me", "Cancel"])
+
+        # Case 2: email not possible -> 2 buttons
+        card2 = build_hitl_prompt("aid2", "preview", "share_file", can_email=False)
+        buttons2 = card2["reply_markup"].inline_keyboard[0]
+        labels2 = [b.text for b in buttons2]
+        self.assertEqual(labels2, ["Send here", "Cancel"])
+
+    def test_email_button_forces_delivery_email_and_configured_recipient(self):
+        import config
+        import main
+        from core.state_manager import StateManager
+
+        sm = StateManager()
+        action = sm.create_action(
+            tool_name="share_file",
+            kwargs={"path": "report.pdf"},
+            description="send report",
+            user_id=99,
+        )
+
+        mock_plugin = MagicMock()
+        mock_plugin.execute = AsyncMock(return_value=MagicMock(success=True, data={}, output="Sent!"))
+
+        mock_orch = MagicMock()
+        mock_orch.state_manager = sm
+        mock_orch.registry = {"share_file": mock_plugin}
+        mock_orch.resume_tool_loop = AsyncMock(return_value="Email sent.")
+
+        update = MagicMock()
+        update.effective_user.id = 99
+        query = MagicMock()
+        query.data = f"hitl:email:{action.approval_id}"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update.callback_query = query
+
+        with patch.object(main, "_orchestrator", mock_orch), \
+             patch.object(main, "_is_allowed", return_value=True), \
+             patch.object(config, "USER_DEFAULT_EMAIL", "default_user@example.com"):
+
+            _run(main.handle_callback_query(update, MagicMock()))
+
+            mock_plugin.execute.assert_called_once()
+            exec_kwargs = mock_plugin.execute.call_args.kwargs
+            self.assertEqual(exec_kwargs["delivery"], "email")
+            self.assertEqual(exec_kwargs["to_email"], "default_user@example.com")
+
+    def test_share_file_not_in_tools_passed_to_llm(self):
+        from core.llm_engine import LLMEngine
+        from core.orchestrator import Orchestrator
+
+        orch = Orchestrator(llm=MagicMock(spec=LLMEngine), state_manager=self.sm, choice_store=self.cs)
+        tools = orch._chat_tools()
+        tool_names = [t["function"]["name"] for t in tools]
+
+        self.assertNotIn("share_file", tool_names)
+        self.assertNotIn("save_memory", tool_names)
+        self.assertIn("find_files", tool_names)
+        self.assertIn("list_folder", tool_names)
+
+    def test_send_email_model_facing_schema_has_no_attachment_path(self):
+        from plugins.p_gmail import GmailPlugin
+
+        p = GmailPlugin()
+        spec = p.to_tool_spec()
+        self.assertNotIn("attachment_path", spec["parameters"]["properties"])
+        self.assertIn("attachment_path", p.parameters_schema["properties"])
 
 
 if __name__ == "__main__":

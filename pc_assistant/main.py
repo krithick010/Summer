@@ -194,7 +194,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/help   — This help text\n"
         "/clear  — Reset conversation history\n"
         "/status — Quick PC health check\n"
-        "/cancel — Cancel any pending approval\n\n"
+        "/cancel — Cancel any pending approval\n"
+        "/find <words>   — Search files\n"
+        "/browse [path]  — Browse folders\n"
+        "/index  — Check file index status\n"
+        "/reindex — Trigger immediate reindex\n\n"
         "Or just *type a natural-language request* and I'll figure out what to do! 🤖",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -271,6 +275,77 @@ async def cmd_reindex(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     from plugins.file_index import file_indexer  # noqa: PLC0415
     file_indexer.reindex()
     await update.message.reply_text("Reindex started.")
+
+
+async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/find <words> — Search for files or folders matching keywords."""
+    user_id = update.effective_user.id
+    if not _is_allowed(user_id):
+        await update.message.reply_text(_deny_message())
+        return
+
+    query_str = " ".join(context.args).strip() if context.args else ""
+    if not query_str:
+        await update.message.reply_text("Usage: /find <keywords>")
+        return
+
+    if not _orchestrator:
+        await update.message.reply_text("Assistant not ready.")
+        return
+
+    _orchestrator.intent_router.update_context(user_id, last_query=query_str)
+    res = await _orchestrator.run_tool(
+        tool_name="find_files",
+        kwargs={"query": query_str, "user_id": user_id},
+        chat_id=update.effective_chat.id,
+    )
+    if isinstance(res.data, dict) and res.data.get("choices"):
+        choices = res.data["choices"]
+        token = _orchestrator.choice_store.register(user_id, choices)
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton(c["label"], callback_data=f"pick:{token}:{idx}")]
+                for idx, c in enumerate(choices)
+            ]
+        )
+        reply_text = str(res.data.get("direct_reply") or res.output or "")
+        await _safe_reply_text(update.message, reply_text, reply_markup=keyboard)
+    else:
+        reply_text = str(res.data.get("direct_reply") if isinstance(res.data, dict) and res.data.get("direct_reply") else res.output)
+        await _safe_reply_text(update.message, reply_text)
+
+
+async def cmd_browse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/browse [path] — Browse folders and files."""
+    user_id = update.effective_user.id
+    if not _is_allowed(user_id):
+        await update.message.reply_text(_deny_message())
+        return
+
+    path_str = " ".join(context.args).strip() if context.args else ""
+    if not _orchestrator:
+        await update.message.reply_text("Assistant not ready.")
+        return
+
+    res = await _orchestrator.run_tool(
+        tool_name="list_folder",
+        kwargs={"path": path_str, "user_id": user_id},
+        chat_id=update.effective_chat.id,
+    )
+    if isinstance(res.data, dict) and res.data.get("choices"):
+        choices = res.data["choices"]
+        token = _orchestrator.choice_store.register(user_id, choices)
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton(c["label"], callback_data=f"pick:{token}:{idx}")]
+                for idx, c in enumerate(choices)
+            ]
+        )
+        reply_text = str(res.data.get("direct_reply") or res.output or "")
+        await _safe_reply_text(update.message, reply_text, reply_markup=keyboard)
+    else:
+        reply_text = str(res.data.get("direct_reply") if isinstance(res.data, dict) and res.data.get("direct_reply") else res.output)
+        await _safe_reply_text(update.message, reply_text)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -430,13 +505,19 @@ async def handle_callback_query(
         )
         return
 
-    if action == "approve":
-        await query.edit_message_text("✅ Approved! Executing…")
+    if action in ("approve", "email"):
+        status_msg = "📧 Sending via email…" if action == "email" else "✅ Approved! Executing…"
+        await query.edit_message_text(status_msg)
         try:
             # 1. Execute plugin directly
             exec_kwargs = dict(pending.get("kwargs") or {})
             if pending.get("tool_name") == "share_file":
                 exec_kwargs["user_id"] = user_id
+                if action == "email":
+                    exec_kwargs["delivery"] = "email"
+                    exec_kwargs["to_email"] = config.USER_DEFAULT_EMAIL or config.GMAIL_SENDER_EMAIL
+                else:
+                    exec_kwargs["delivery"] = "telegram"
             plugin = _orchestrator.registry.get(pending["tool_name"]) if _orchestrator else None
             if plugin is not None:
                 result = await plugin.execute(**exec_kwargs)
@@ -617,28 +698,42 @@ def build_hitl_prompt(
     approval_id: str,
     preview_text: str,
     tool_name: str,
+    can_email: bool = False,
 ) -> dict[str, Any]:
     """Return a dict with ``text``, ``reply_markup``, and ``parse_mode=HTML`` for a HITL prompt."""
     escaped_tool = html.escape(tool_name)
     escaped_preview = html.escape(preview_text)
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "✅ Approve", callback_data=f"hitl:approve:{approval_id}"
-                ),
-                InlineKeyboardButton(
-                    "❌ Cancel", callback_data=f"hitl:cancel:{approval_id}"
-                ),
-            ]
+    if tool_name == "share_file":
+        buttons = [
+            InlineKeyboardButton("Send here", callback_data=f"hitl:approve:{approval_id}"),
         ]
-    )
+        if can_email:
+            buttons.append(
+                InlineKeyboardButton("Email me", callback_data=f"hitl:email:{approval_id}")
+            )
+        buttons.append(
+            InlineKeyboardButton("Cancel", callback_data=f"hitl:cancel:{approval_id}")
+        )
+        keyboard = InlineKeyboardMarkup([buttons])
+    else:
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ Approve", callback_data=f"hitl:approve:{approval_id}"
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Cancel", callback_data=f"hitl:cancel:{approval_id}"
+                    ),
+                ]
+            ]
+        )
     return {
         "text": (
             f"🔐 <b>Action requires your approval</b>\n\n"
             f"<b>Tool:</b> <code>{escaped_tool}</code>\n\n"
             f"{escaped_preview}\n\n"
-            "<i>Tap Approve or Cancel below.</i>"
+            "<i>Tap an option below.</i>"
         ),
         "reply_markup": keyboard,
         "parse_mode": ParseMode.HTML,
@@ -665,6 +760,8 @@ def _build_telegram_app() -> Application:
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("find", cmd_find))
+    app.add_handler(CommandHandler("browse", cmd_browse))
     app.add_handler(CommandHandler("index", cmd_index))
     app.add_handler(CommandHandler("reindex", cmd_reindex))
     app.add_handler(CallbackQueryHandler(handle_callback_query))

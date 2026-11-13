@@ -41,7 +41,6 @@ class ChoicesReply:
 
 
 SYSTEM_TEMPLATE = """You are {assistant_name}, {user_name}'s personal assistant running privately on their own PC.
-You are chatting with {user_name} directly inside Telegram right now.
 Talk like a close friend texting: casual, short (1-2 sentences), natural. No corporate phrases, no "As an AI".
 - When they ask for something you know, just say it: "Her number's 555-0123." No lead-in.
 - When they tell you a fact, a quick ack is enough: "Noted.", "Saved that.", "Got it, new email's in."
@@ -64,7 +63,7 @@ def _format_tools_section(plugins_arg: Iterable[PluginBase] | Mapping[str, Plugi
     if plugins_arg is not None:
         plugin_iter = plugins_arg.values() if isinstance(plugins_arg, Mapping) else plugins_arg
         for p in plugin_iter:
-            if p.name == "save_memory":
+            if p.name in ("save_memory", "share_file"):
                 continue
             is_avail = getattr(p, "is_available", None)
             if callable(is_avail) and not is_avail():
@@ -75,7 +74,7 @@ def _format_tools_section(plugins_arg: Iterable[PluginBase] | Mapping[str, Plugi
     lines = [
         "TOOLS (use them, never guess):",
         *plugin_lines,
-        "- When they ask to share, send, or get a file or folder, call share_file (or find_files if searching). The file will be sent right here in this Telegram chat.",
+        "- File requests are handled by dedicated commands and buttons; if asked to find a file, call find_files.",
         "- Never answer weather, news, lookups or PC stats from your own knowledge. If you did not call the tool, you do not have the answer.",
         "- Never say you found, opened, sent or emailed anything unless a tool result says so. You cannot open files on this PC.",
         "- Call the tool again every time, even if you answered something similar earlier.",
@@ -171,19 +170,29 @@ class Orchestrator:
                         log.error("Failed to instantiate plugin %s: %s", obj.__name__, exc)
 
     def _chat_tools(self) -> list[dict[str, Any]]:
-        """Build Ollama tool schemas for all active non-memory plugins."""
-        return [
-            {
+        """Build Ollama tool schemas for all active non-memory plugins (hiding share_file)."""
+        tools = []
+        for p in self.registry.values():
+            if p.name in ("save_memory", "share_file"):
+                continue
+            params = p.parameters_schema
+            if p.name == "send_email" and isinstance(params, dict):
+                params = dict(params)
+                if "properties" in params:
+                    props = dict(params["properties"])
+                    props.pop("attachment_path", None)
+                    params["properties"] = props
+                if "required" in params and isinstance(params["required"], list):
+                    params["required"] = [r for r in params["required"] if r != "attachment_path"]
+            tools.append({
                 "type": "function",
                 "function": {
                     "name": p.name,
                     "description": p.description,
-                    "parameters": p.parameters_schema,
+                    "parameters": params,
                 },
-            }
-            for p in self.registry.values()
-            if p.name != "save_memory"
-        ]
+            })
+        return tools
 
     async def request_tool_approval(
         self,
@@ -197,6 +206,45 @@ class Orchestrator:
             return {"text": f"Unknown tool: {tool_name}"}
         allowed = plugin.parameters_schema.get("properties", {})
         filtered_args = {k: v for k, v in kwargs.items() if k in allowed} if allowed else {}
+
+        # Preflight checks for share_file
+        can_email = False
+        if tool_name == "share_file":
+            raw_target = str(filtered_args.get("path") or filtered_args.get("query") or "").strip()
+            target_path, matches, err_msg = await asyncio.to_thread(resolve_share_target, raw_target)
+            if err_msg or not target_path:
+                reason = str(err_msg or f"File not found: '{raw_target}'")
+                return {"text": reason}
+
+            from plugins.file_search import is_sensitive_path  # noqa: PLC0415
+            if is_sensitive_path(target_path):
+                return {"text": f"'{target_path.name}' is sensitive/protected and cannot be shared."}
+
+            try:
+                if target_path.is_dir():
+                    target_size = sum(f.stat().st_size for f in target_path.rglob("*") if f.is_file())
+                else:
+                    target_size = target_path.stat().st_size
+            except Exception:
+                target_size = 0
+
+            max_split_mb = getattr(config, "FILE_MAX_SPLIT_MB", 150)
+            max_split_bytes = max_split_mb * 1024 * 1024
+            if target_size > max_split_bytes:
+                return {
+                    "text": (
+                        f"'{target_path.name}' is {format_size(target_size)}. "
+                        "Telegram bots can upload 50 MB (150 MB in parts); Gmail allows 25 MB."
+                    )
+                }
+
+            # Check if email is available and size <= 25 MB
+            gmail_plugin = self.registry.get("send_email")
+            gmail_avail = False
+            if gmail_plugin and hasattr(gmail_plugin, "is_available"):
+                gmail_avail = bool(gmail_plugin.is_available())
+            can_email = gmail_avail and (target_size <= 25 * 1024 * 1024)
+
         try:
             custom_preview = await plugin.prepare_preview(filtered_args)
         except Exception as exc:  # noqa: BLE001
@@ -212,11 +260,20 @@ class Orchestrator:
         if self._hitl_builder is None:
             log.error("HITL builder not set — cannot pause for approval.")
             return {"text": "⚠️ Internal configuration error: HITL builder not registered."}
-        return self._hitl_builder(
-            approval_id=action.approval_id,
-            preview_text=preview,
-            tool_name=tool_name,
-        )
+        try:
+            return self._hitl_builder(
+                approval_id=action.approval_id,
+                preview_text=preview,
+                tool_name=tool_name,
+                can_email=can_email,
+            )
+        except TypeError:
+            # Fallback if hitl_builder does not accept can_email
+            return self._hitl_builder(
+                approval_id=action.approval_id,
+                preview_text=preview,
+                tool_name=tool_name,
+            )
 
     async def run_tool(
         self,
