@@ -126,6 +126,10 @@ class TestImports(unittest.TestCase):
         self.assertEqual(FindFilesPlugin().name, "find_files")
         self.assertEqual(ShareFilePlugin().name, "share_file")
 
+    def test_import_p_folder(self):
+        from plugins.p_folder import ListFolderPlugin
+        self.assertEqual(ListFolderPlugin().name, "list_folder")
+
     def test_import_memory(self):
         from core.memory import MemoryManager
         self.assertTrue(callable(MemoryManager))
@@ -4003,6 +4007,167 @@ class TestFileIndex(unittest.TestCase):
                         _run(main.cmd_reindex(mock_update, mock_context))
                         mock_reindex.assert_called_once()
                         mock_update.message.reply_text.assert_called_with("Reindex started.")
+
+
+class TestListFolder(unittest.TestCase):
+    """Test ListFolderPlugin directory browsing, paging, security filtering, and inline callback handling."""
+
+    def setUp(self):
+        from plugins.p_folder import ListFolderPlugin
+        self.plugin = ListFolderPlugin()
+
+    def test_schema_and_flags(self):
+        self.assertEqual(self.plugin.name, "list_folder")
+        self.assertFalse(self.plugin.requires_approval)
+        self.assertEqual(self.plugin.usage_hint, "when they ask what is in a folder or drive")
+        self.assertEqual(self.plugin.parameters_schema["type"], "object")
+
+    def test_list_folder_paging_and_navigation(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "work"
+            base.mkdir()
+            # 2 directories
+            (base / "alpha_dir").mkdir()
+            (base / "beta_dir").mkdir()
+            # 10 files
+            for i in range(1, 11):
+                p = base / f"doc_{i:02d}.txt"
+                p.write_text(f"content {i}")
+                # stagger mtimes
+                os.utime(p, (1000 + i * 10, 1000 + i * 10))
+
+            # Page 1: offset=0
+            res1 = _run(self.plugin.execute(path=str(base), offset=0))
+            self.assertTrue(res1.success)
+            choices1 = res1.data["choices"]
+            labels1 = [c["label"] for c in choices1]
+
+            # Up navigation choice
+            self.assertEqual(labels1[0], "⬆ Up")
+            self.assertEqual(choices1[0]["tool"], "list_folder")
+            self.assertEqual(choices1[0]["kwargs"]["path"], str(base.parent.resolve()))
+
+            # Dirs first, alphabetical
+            self.assertEqual(labels1[1], "📁 alpha_dir")
+            self.assertEqual(choices1[1]["tool"], "list_folder")
+            self.assertEqual(labels1[2], "📁 beta_dir")
+            self.assertEqual(choices1[2]["tool"], "list_folder")
+
+            # Followed by files (newest first: doc_10 down to doc_05)
+            self.assertEqual(labels1[3], "📄 doc_10.txt")
+            self.assertEqual(choices1[3]["tool"], "share_file")
+
+            # More navigation choice at the end
+            self.assertEqual(labels1[-1], "➡ More")
+            self.assertEqual(choices1[-1]["tool"], "list_folder")
+            self.assertEqual(choices1[-1]["kwargs"]["offset"], 8)
+
+            # Total items on page 1: 1 Up + 8 items + 1 More = 10 choices
+            self.assertEqual(len(choices1), 10)
+
+            # Page 2: offset=8
+            res2 = _run(self.plugin.execute(path=str(base), offset=8))
+            self.assertTrue(res2.success)
+            choices2 = res2.data["choices"]
+            labels2 = [c["label"] for c in choices2]
+
+            self.assertEqual(labels2[0], "⬆ Up")
+            # 4 remaining files
+            self.assertEqual(len(choices2), 1 + 4)  # Up + 4 files, no More
+            self.assertNotIn("➡ More", labels2)
+
+    def test_sensitive_and_excluded_hidden_from_browse(self):
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td) / "projects"
+            folder.mkdir()
+            (folder / "allowed_dir").mkdir()
+            (folder / "normal_file.txt").write_text("ok")
+
+            # Excluded / sensitive items
+            (folder / ".git").mkdir()
+            (folder / "node_modules").mkdir()
+            (folder / "id_rsa").write_text("secret")
+            (folder / ".env").write_text("secret")
+
+            res = _run(self.plugin.execute(path=str(folder)))
+            self.assertTrue(res.success)
+            choices = res.data["choices"]
+            labels = [c["label"] for c in choices]
+
+            self.assertIn("📁 allowed_dir", labels)
+            self.assertIn("📄 normal_file.txt", labels)
+            self.assertNotIn("📁 .git", labels)
+            self.assertNotIn("📁 node_modules", labels)
+            self.assertNotIn("📄 id_rsa", labels)
+            self.assertNotIn("📄 .env", labels)
+
+    def test_sensitive_or_excluded_folder_access_blocked(self):
+        with tempfile.TemporaryDirectory() as td:
+            secret_folder = Path(td) / ".ssh"
+            secret_folder.mkdir()
+
+            res = _run(self.plugin.execute(path=str(secret_folder)))
+            self.assertFalse(res.success)
+            self.assertIn("restricted", res.output.lower())
+
+    def test_empty_path_lists_roots(self):
+        with tempfile.TemporaryDirectory() as td:
+            r1 = Path(td) / "Disk1"
+            r2 = Path(td) / "Disk2"
+            r1.mkdir()
+            r2.mkdir()
+
+            with patch("plugins.p_folder.roots_for_mode", return_value=[r1, r2]):
+                res = _run(self.plugin.execute(path=""))
+                self.assertTrue(res.success)
+                choices = res.data["choices"]
+                labels = [c["label"] for c in choices]
+                self.assertIn(f"📁 {r1.name}", labels)
+                self.assertIn(f"📁 {r2.name}", labels)
+
+    def test_callback_query_inline_execution_for_non_approval(self):
+        import config
+        import main
+        from core.choices import choice_store
+
+        with tempfile.TemporaryDirectory() as td:
+            test_dir = Path(td) / "browse_me"
+            test_dir.mkdir()
+            (test_dir / "sample.txt").write_text("hello")
+
+            token = choice_store.register(
+                123456,
+                [{"label": "📁 browse_me", "tool": "list_folder", "kwargs": {"path": str(test_dir)}}],
+            )
+
+            mock_update = MagicMock()
+            mock_query = MagicMock()
+            mock_query.from_user.id = 123456
+            mock_query.data = f"pick:{token}:0"
+            mock_query.answer = AsyncMock()
+            mock_query.edit_message_text = AsyncMock()
+            mock_update.callback_query = mock_query
+            mock_context = MagicMock()
+
+            orig_orch = main._orchestrator
+            mock_orch = MagicMock()
+            mock_orch.registry = {"list_folder": self.plugin}
+            main._orchestrator = mock_orch
+
+            with patch.object(config, "ALLOWED_USER_IDS", [123456]):
+                try:
+                    _run(main.handle_callback_query(mock_update, mock_context))
+                    mock_query.answer.assert_called_once()
+                    mock_query.edit_message_text.assert_called_once()
+                    args, kwargs = mock_query.edit_message_text.call_args
+                    self.assertIn("📂", args[0])
+                    self.assertIn("sample.txt", args[0])
+                    # Reply markup must have inline buttons
+                    self.assertIn("reply_markup", kwargs)
+                    # request_tool_approval must NOT have been called
+                    mock_orch.request_tool_approval.assert_not_called()
+                finally:
+                    main._orchestrator = orig_orch
 
 
 if __name__ == "__main__":

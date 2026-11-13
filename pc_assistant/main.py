@@ -373,6 +373,30 @@ async def handle_callback_query(
             await query.edit_message_text("Assistant is not ready.")
             return
 
+        plugin = _orchestrator.registry.get(tool_name) if _orchestrator else None
+        if plugin is not None and not getattr(plugin, "requires_approval", True):
+            # Tool does not require HITL approval (e.g. list_folder) -> execute inline!
+            result = await plugin.execute(**kwargs)
+            choices_list = (result.data or {}).get("choices") if result.data else None
+            if choices_list:
+                new_token = choice_store.register(user_id, choices_list)
+                keyboard = InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton(c["label"], callback_data=f"pick:{new_token}:{i}")]
+                        for i, c in enumerate(choices_list)
+                    ]
+                )
+                try:
+                    await query.edit_message_text(result.output, reply_markup=keyboard)
+                except Exception:
+                    pass
+            else:
+                try:
+                    await query.edit_message_text(result.output)
+                except Exception:
+                    pass
+            return
+
         approval_payload = await _orchestrator.request_tool_approval(user_id, tool_name, kwargs)
         if isinstance(approval_payload, dict) and "reply_markup" in approval_payload:
             await query.edit_message_text(
